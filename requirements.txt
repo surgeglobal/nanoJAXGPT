@@ -1,1 +1,3 @@
 python-dotenv
+jax
+equinox
