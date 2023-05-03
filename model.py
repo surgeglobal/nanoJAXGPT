@@ -25,7 +25,7 @@ def new_gelu(x):
     Implementation of the GELU activation function currently in Google BERT repo (identical to OpenAI GPT).
     Reference: Gaussian Error Linear Units (GELU) paper: https://arxiv.org/abs/1606.08415
     """
-    return 0.5 * x * (1.0 + jnp.tanh(math.sqrt(2.0 / math.pi) * (x + 0.044715 * jnp.power(x, 3.0))))
+    return 0.5 * x * (1.0 + jnp.tanh(jnp.sqrt(2.0 / jnp.pi) * (x + 0.044715 * jnp.power(x, 3.0))))
 
 
 class CausalSelfAttention(nn.Module):
@@ -99,14 +99,16 @@ class MLP(eqx.Module):
         return x
 
 
-class Block(nn.Module):
+class Block(eqx.Module):
+    ln_1: eqx.nn.LayerNorm
+    ln_2: eqx.nn.LayerNorm
 
     def __init__(self, config):
         super().__init__()
-        self.ln_1 = LayerNorm(config.n_embd, bias=config.bias)
+        self.ln_1 = eqx.nn.LayerNorm(config.n_embd, use_bias=config.bias)
         self.attn = CausalSelfAttention(config)
-        self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)
-        self.mlp = MLP(config)
+        self.ln_2 = eqx.nn.LayerNorm(config.n_embd, use_bias=config.bias)
+        self.mlp  = MLP(config)
 
     def forward(self, x):
         x = x + self.attn(self.ln_1(x))
