@@ -21,6 +21,7 @@ from torch.nn import functional as F
 
 
 # @torch.jit.script # good to enable when not using torch.compile, disable when using (our default)
+@jax.jit
 def new_gelu(x):
     """
     Implementation of the GELU activation function currently in Google BERT repo (identical to OpenAI GPT).
@@ -106,6 +107,7 @@ class MLP(eqx.Module):
         x = self.dropout(x)
         return x
 
+    @jax.jit
     def __call__(self, x):
         self.forward(x)
 
@@ -127,6 +129,10 @@ class Block(eqx.Module):
         ln2 = jax.vmap(self.ln_2)(x)
         x = x + jax.vmap(self.mlp)(ln2)
         return x
+
+    @jax.jit
+    def __call__(self, x):
+        return self.forward(x)
 
 
 @dataclass
