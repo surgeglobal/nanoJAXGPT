@@ -12,6 +12,7 @@ import inspect
 from dataclasses import dataclass
 
 import jax
+from jax import lax
 import jax.numpy as jnp
 import equinox as eqx
 import torch
@@ -28,56 +29,63 @@ def new_gelu(x):
     return 0.5 * x * (1.0 + jnp.tanh(jnp.sqrt(2.0 / jnp.pi) * (x + 0.044715 * jnp.power(x, 3.0))))
 
 
-class CausalSelfAttention(nn.Module):
+class CausalSelfAttention(eqx.Module):
+    c_attn: eqx.nn.Linear
+    c_proj: eqx.nn.Linear
+    attn_dropout: eqx.nn.Dropout
+    resid_dropout: eqx.nn.Dropout
 
-    def __init__(self, config):
+    def __init__(self, config, key):
         super().__init__()
         assert config.n_embd % config.n_head == 0
+
+        # PRNGKey
+        lkey1, lkey2 = jax.random.split(key, 2)
+
         # key, query, value projections for all heads, but in a batch
-        self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd, bias=config.bias)
+        self.c_attn = eqx.nn.Linear(config.n_embd, 3 * config.n_embd, use_bias=config.bias, key=lkey1)
         # output projection
-        self.c_proj = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
+        self.c_proj = eqx.nn.Linear(config.n_embd, config.n_embd, use_bias=config.bias, key=lkey2)
         # regularization
-        self.attn_dropout = nn.Dropout(config.dropout)
-        self.resid_dropout = nn.Dropout(config.dropout)
+        self.attn_dropout = eqx.nn.Dropout(config.dropout)
+        self.resid_dropout = eqx.nn.Dropout(config.dropout)
         self.n_head = config.n_head
         self.n_embd = config.n_embd
         self.dropout = config.dropout
-        # flash attention make GPU go brrrrr but support is only in PyTorch >= 2.0
-        self.flash = hasattr(torch.nn.functional, 'scaled_dot_product_attention')
-        if not self.flash:
-            print("WARNING: using slow attention. Flash Attention requires PyTorch >= 2.0")
-            # causal mask to ensure that attention is only applied to the left in the input sequence
-            self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size))
-                                 .view(1, 1, config.block_size, config.block_size))
+        # causal mask to ensure that attention is only applied to the left in the input sequence
+        # Has been made a buffer by using lax.stop_gradient whenever it is used.
+        # Immutability calls for reshape, plus there is no view for jnp (or numpy) arrays.
+        self.bias = jnp.tril(jnp.ones(config.block_size, config.block_size)).reshape(1, 1, config.block_size,
+                                                                                     config.block_size)
 
     def forward(self, x):
-        B, T, C = x.size()  # batch size, sequence length, embedding dimensionality (n_embd)
+        B, T, C = jnp.shape(x)  # batch size, sequence length, embedding dimensionality (n_embd)
 
         # calculate query, key, values for all heads in batch and move head forward to be the batch dim
-        q, k, v = self.c_attn(x).split(self.n_embd, dim=2)
-        k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)  # (B, nh, T, hs)
-        q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)  # (B, nh, T, hs)
-        v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)  # (B, nh, T, hs)
+        q, k, v = jnp.split(jax.vmap(self.c_attn)(x), self.n_embd, axis=2)
+        # Immutability calls for reshape, plus there is no view for jnp (or numpy) arrays.
+        k = k.reshape(B, T, self.n_head, C // self.n_head).transpose(1, 2)  # (B, nh, T, hs)
+        q = q.reshape(B, T, self.n_head, C // self.n_head).transpose(1, 2)  # (B, nh, T, hs)
+        v = v.reshape(B, T, self.n_head, C // self.n_head).transpose(1, 2)  # (B, nh, T, hs)
 
-        # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
-        if self.flash:
-            # efficient attention using Flash Attention CUDA kernels
-            y = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=None,
-                                                                 dropout_p=self.dropout if self.training else 0,
-                                                                 is_causal=True)
-        else:
-            # manual implementation of attention
-            att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
-            att = att.masked_fill(self.bias[:, :, :T, :T] == 0, float('-inf'))
-            att = F.softmax(att, dim=-1)
-            att = self.attn_dropout(att)
-            y = att @ v  # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
-        y = y.transpose(1, 2).contiguous().view(B, T, C)  # re-assemble all head outputs side by side
+        # manual implementation of attention
+        att = jnp.matmul(q, jnp.swapaxes(k, -2, -1)) / jnp.sqrt(jnp.shape(k)[-1])
+        # Note: Added the stop_gradient just to be safe, I see no update rule acting on the bias inside the
+        # forward pass.
+        att = jnp.where(lax.stop_gradient(self.bias[:, :, :T, :T]) == 0, float('-inf'), att)
+        att = jax.nn.softmax(att, axis=-1)
+        att = jax.vmap(self.attn_dropout)(att)
+        y = jnp.matmul(att, v)  # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
+        # Reshaping with Immutability creates a new copy
+        y = y.transpose(1, 2).reshape(B, T, C)  # re-assemble all head outputs side by side
 
         # output projection
-        y = self.resid_dropout(self.c_proj(y))
+        y = jax.vmap(self.resid_dropout)(jax.vmap(self.c_proj)(y))
         return y
+
+    @jax.jit
+    def __call__(self, x):
+        return self.forward(x)
 
 
 class MLP(eqx.Module):
