@@ -19,6 +19,10 @@ import torch
 import torch.nn as nn
 from torch.nn import functional as F
 
+from helpers import init
+
+from typing import Callable
+
 
 # @torch.jit.script # good to enable when not using torch.compile, disable when using (our default)
 @jax.jit
@@ -84,20 +88,17 @@ class CausalSelfAttention(eqx.Module):
         y = jax.vmap(self.resid_dropout)(jax.vmap(self.c_proj)(y))
         return y
 
-    @jax.jit
-    def __call__(self, x):
-        return self.forward(x)
-
 
 class MLP(eqx.Module):
     c_fc: eqx.nn.Linear
     c_proj: eqx.nn.Linear
     dropout: eqx.nn.Dropout
 
-    def __init__(self, config):
+    def __init__(self, config, key):
         super().__init__()
-        self.c_fc = eqx.nn.Linear(config.n_embd, 4 * config.n_embd, use_bias=config.bias)
-        self.c_proj = eqx.nn.Linear(4 * config.n_embd, config.n_embd, use_bias=config.bias)
+        lkey1, lkey2 = jax.random.split(key, 2)
+        self.c_fc = eqx.nn.Linear(config.n_embd, 4 * config.n_embd, use_bias=config.bias, key=lkey1)
+        self.c_proj = eqx.nn.Linear(4 * config.n_embd, config.n_embd, use_bias=config.bias, key=lkey2)
         self.dropout = eqx.nn.Dropout(config.dropout)
 
     def forward(self, x):
@@ -134,6 +135,9 @@ class Block(eqx.Module):
     def __call__(self, x):
         return self.forward(x)
 
+    def __call__(self, x):
+        return self.forward(x)
+
 
 @dataclass
 class GPTConfig:
@@ -146,30 +150,33 @@ class GPTConfig:
     bias: bool = True  # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
 
 
-class GPT(nn.Module):
+class GPT(eqx.Module):
 
-    def __init__(self, config):
+    def __init__(self, config, key):
         super().__init__()
+        ekey1, ekey2, lmhkey = jax.random.split(key, 3)
         assert config.vocab_size is not None
         assert config.block_size is not None
         self.config = config
 
-        self.transformer = nn.ModuleDict(dict(
-            wte=nn.Embedding(config.vocab_size, config.n_embd),
-            wpe=nn.Embedding(config.block_size, config.n_embd),
-            drop=nn.Dropout(config.dropout),
-            h=nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
-            ln_f=LayerNorm(config.n_embd, bias=config.bias),
-        ))
-        self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
+        # TODO Lookup ModuleList, ModuleDict and how it affects in Equinox
+        self.transformer = dict(
+            wte=eqx.nn.Embedding(config.vocab_size, config.n_embd, key=ekey1),
+            wpe=eqx.nn.Embedding(config.block_size, config.n_embd, key=ekey2),
+            drop=eqx.nn.Dropout(config.dropout),
+            h=[Block(config) for _ in range(config.n_layer)],
+            ln_f=eqx.nn.LayerNorm(config.n_embd, bias=config.bias),
+        )
+        self.lm_head = eqx.nn.Linear(config.n_embd, config.vocab_size, use_bias=False, key=lmhkey)
         # with weight tying when using torch.compile() some warnings get generated:
         # "UserWarning: functional_call was passed multiple values for tied weights.
         # This behavior is deprecated and will be an error in future versions"
         # not 100% sure what this is, so far seems to be harmless. TODO investigate
-        self.transformer.wte.weight = self.lm_head.weight  # https://paperswithcode.com/method/weight-tying
+        self.transformer["wte"].weight = self.lm_head.weight  # https://paperswithcode.com/method/weight-tying
 
         # init all weights
-        self.apply(self._init_weights)
+        self._init_weights(self)
+        # TODO: Update the rest of the code from here
         # apply special scaled init to the residual projections, per GPT-2 paper
         for pn, p in self.named_parameters():
             if pn.endswith('c_proj.weight'):
@@ -190,13 +197,40 @@ class GPT(nn.Module):
             n_params -= self.transformer.wpe.weight.numel()
         return n_params
 
-    def _init_weights(self, module):
-        if isinstance(module, nn.Linear):
-            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
-            if module.bias is not None:
-                torch.nn.init.zeros_(module.bias)
-        elif isinstance(module, nn.Embedding):
-            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+    @staticmethod
+    def _init_weights(model: eqx.Module, key: jax.random.PRNGKey = jax.random.PRNGKey(0)):
+        def init_layer(model, is_layer: Callable, mean: float, std: float):
+            get_weights = lambda m: [x.weight
+                                     for x in jax.tree_util.tree_leaves(m, is_leaf=is_layer)
+                                     if is_layer(x)]
+            weights = get_weights(model)
+
+            new_weights = [init.normal_(weight, mean=mean, std=std, key=subkey)
+                           for weight, subkey in zip(weights, jax.random.split(key, len(weights)))]
+
+            return eqx.tree_at(get_weights, model, new_weights)
+
+        def init_linear(model):
+            is_linear = lambda x: isinstance(x, eqx.nn.Linear)
+
+            model = init_layer(model, is_linear, mean=0.0, std=0.2)
+
+            get_biases = lambda m: [x.bias
+                                    for x in jax.tree_util.tree_leaves(m, is_leaf=is_linear)
+                                    if is_linear(x) and x.bias is not None]
+            biases = get_biases(model)
+
+            new_biases = [init.zeros_(bias) for bias in biases]
+
+            return eqx.tree_at(get_biases, model, new_biases)
+
+        def init_embedding(model):
+            is_embedding = lambda x: isinstance(x, eqx.nn.Embedding)
+
+            return init_layer(model, is_embedding, mean=0.0, std=0.2)
+
+        model = init_linear(model)
+        model = init_embedding(model)
 
     def forward(self, idx, targets=None):
         device = idx.device
