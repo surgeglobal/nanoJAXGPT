@@ -15,6 +15,8 @@ import jax
 from jax import lax
 import jax.numpy as jnp
 import equinox as eqx
+import optax
+
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
@@ -87,6 +89,10 @@ class CausalSelfAttention(eqx.Module):
         # output projection
         y = jax.vmap(self.resid_dropout)(jax.vmap(self.c_proj)(y))
         return y
+
+    @jax.jit
+    def __call__(self, x):
+        return self.forward(x)
 
 
 class MLP(eqx.Module):
@@ -176,8 +182,9 @@ class GPT(eqx.Module):
 
         # init all weights
         self._init_weights(self)
-        # TODO: Update the rest of the code from here
         # apply special scaled init to the residual projections, per GPT-2 paper
+
+        # TODO Complete this code block
         for pn, p in self.named_parameters():
             if pn.endswith('c_proj.weight'):
                 torch.nn.init.normal_(p, mean=0.0, std=0.02 / math.sqrt(2 * config.n_layer))
@@ -192,9 +199,9 @@ class GPT(eqx.Module):
         The token embeddings would too, except due to the parameter sharing these
         params are actually used as weights in the final layer, so we include them.
         """
-        n_params = sum(p.numel() for p in self.parameters())
+        n_params = sum(jnp.prod(p.shape) for p in jax.tree_util.tree_leaves(self))
         if non_embedding:
-            n_params -= self.transformer.wpe.weight.numel()
+            n_params -= jnp.prod(self.transformer["wpe"].weight.shape)
         return n_params
 
     @staticmethod
@@ -233,23 +240,23 @@ class GPT(eqx.Module):
         model = init_embedding(model)
 
     def forward(self, idx, targets=None):
-        device = idx.device
-        b, t = idx.size()
+        # TODO Removed device. Check for affects
+        b, t = idx.shape # TODO Check what idx is sent
         assert t <= self.config.block_size, f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
-        pos = torch.arange(0, t, dtype=torch.long, device=device).unsqueeze(0)  # shape (1, t)
+        pos = jnp.expand_dims(jnp.arange(0, t, dtype=jnp.int64), 0) # shape (1, t)
 
         # forward the GPT model itself
-        tok_emb = self.transformer.wte(idx)  # token embeddings of shape (b, t, n_embd)
-        pos_emb = self.transformer.wpe(pos)  # position embeddings of shape (1, t, n_embd)
-        x = self.transformer.drop(tok_emb + pos_emb)
-        for block in self.transformer.h:
+        tok_emb = self.transformer["wte"](idx)  # token embeddings of shape (b, t, n_embd)
+        pos_emb = self.transformer["wpe"](pos)  # position embeddings of shape (1, t, n_embd)
+        x = self.transformer["drop"](tok_emb + pos_emb)
+        for block in self.transformer["h"]:
             x = block(x)
-        x = self.transformer.ln_f(x)
+        x = self.transformer["ln_f"](x)
 
         if targets is not None:
             # if we are given some desired targets also calculate the loss
             logits = self.lm_head(x)
-            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
+            loss = optax.softmax_cross_entropy(logits.reshape((-1, logits.shape[-1])), targets.reshape(-1))
         else:
             # inference-time mini-optimization: only forward the lm_head on the very last position
             logits = self.lm_head(x[:, [-1], :])  # note: using list [-1] to preserve the time dim
@@ -263,8 +270,8 @@ class GPT(eqx.Module):
         # but want to use a smaller block size for some smaller, simpler model
         assert block_size <= self.config.block_size
         self.config.block_size = block_size
-        self.transformer.wpe.weight = nn.Parameter(self.transformer.wpe.weight[:block_size])
-        for block in self.transformer.h:
+        self.transformer["wpe"].weight = nn.Parameter(self.transformer["wpe"].weight[:block_size])
+        for block in self.transformer["h"]:
             if hasattr(block.attn, 'bias'):
                 block.attn.bias = block.attn.bias[:, :, :block_size, :block_size]
 
