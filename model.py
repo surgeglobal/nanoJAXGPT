@@ -14,11 +14,11 @@ from dataclasses import dataclass
 import jax
 from jax import lax
 import jax.numpy as jnp
+import jax.nn as nn
 import equinox as eqx
 import optax
 
 import torch
-import torch.nn as nn
 from torch.nn import functional as F
 
 from helpers import init
@@ -26,15 +26,18 @@ from helpers import init
 from typing import Callable
 
 
-# @torch.jit.script # good to enable when not using torch.compile, disable when using (our default)
 @jax.jit
-def new_gelu(x):
+def swiglu(x):
     """
-    Implementation of the GELU activation function currently in Google BERT repo (identical to OpenAI GPT).
-    Reference: Gaussian Error Linear Units (GELU) paper: https://arxiv.org/abs/1606.08415
-    """
-    return 0.5 * x * (1.0 + jnp.tanh(jnp.sqrt(2.0 / jnp.pi) * (x + 0.044715 * jnp.power(x, 3.0))))
+    Implementation of the SwiGLU activation function in the paper by Noam Shazeer at Google
 
+    References:
+        GLU Variants Improve Transformer paper  : https://arxiv.org/abs/2002.05202
+        PaLM-pytorch repo by lucidrains         : https://github.com/lucidrains/PaLM-pytorch/blob/main/palm_pytorch/palm_pytorch.py
+    """
+    assert x.shape[-1] % 2 == 0
+    x, gate = jnp.split(x, 2, axis=-1)
+    return nn.swish(gate) * x
 
 class CausalSelfAttention(eqx.Module):
     c_attn: eqx.nn.Linear
@@ -264,6 +267,7 @@ class GPT(eqx.Module):
 
         return logits, loss
 
+    # TODO Look at this block
     def crop_block_size(self, block_size):
         # model surgery to decrease the block size if necessary
         # e.g. we may load the GPT2 pretrained model checkpoint (block size 1024)
