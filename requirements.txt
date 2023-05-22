@@ -1,4 +1,6 @@
-python-dotenv
-jax
-equinox
-optax
+python-dotenv~=1.0.0
+jax>=0.4.6
+equinox>=0.10.4
+optax~=0.1.5
+tqdm~=4.65.0
+transformers~=4.29.2
