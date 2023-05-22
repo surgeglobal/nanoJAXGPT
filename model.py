@@ -15,11 +15,9 @@ import jax
 from jax import lax
 import jax.numpy as jnp
 import jax.nn as nn
+import jax.tree_util as jtu
 import equinox as eqx
 import optax
-
-import torch
-from torch.nn import functional as F
 
 from helpers import init
 
@@ -163,12 +161,12 @@ class GPT(eqx.Module):
 
     def __init__(self, config, key):
         super().__init__()
-        ekey1, ekey2, lmhkey = jax.random.split(key, 3)
+        # TODO: Refine the keys to be generic and not specific
+        ekey1, ekey2, lmhkey, key4 = jax.random.split(key, 4)
         assert config.vocab_size is not None
         assert config.block_size is not None
         self.config = config
 
-        # TODO Lookup ModuleList, ModuleDict and how it affects in Equinox
         self.transformer = dict(
             wte=eqx.nn.Embedding(config.vocab_size, config.n_embd, key=ekey1),
             wpe=eqx.nn.Embedding(config.block_size, config.n_embd, key=ekey2),
@@ -186,11 +184,17 @@ class GPT(eqx.Module):
         # init all weights
         self._init_weights(self)
         # apply special scaled init to the residual projections, per GPT-2 paper
+        for path, p in jax.tree_util.tree_flatten_with_path(self)[0]:
+            pn = ''
 
-        # TODO Complete this code block
-        for pn, p in self.named_parameters():
+            for index in range(len(path)):
+                if isinstance(path[index], jax._src.tree_util.DictKey):
+                    pn += '.' + path[index].key
+                else:
+                    pn += '.' + path[index].name
+
             if pn.endswith('c_proj.weight'):
-                torch.nn.init.normal_(p, mean=0.0, std=0.02 / math.sqrt(2 * config.n_layer))
+                init.normal_(p, mean=0.0, std=0.02 / math.sqrt(2 * config.n_layer), key=key4)
 
         # report number of parameters
         print("number of parameters: %.2fM" % (self.get_num_params() / 1e6,))
@@ -243,7 +247,6 @@ class GPT(eqx.Module):
         model = init_embedding(model)
 
     def forward(self, idx, targets=None):
-        # TODO Removed device. Check for affects
         b, t = idx.shape # TODO Check what idx is sent
         assert t <= self.config.block_size, f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
         pos = jnp.expand_dims(jnp.arange(0, t, dtype=jnp.int64), 0) # shape (1, t)
@@ -267,14 +270,14 @@ class GPT(eqx.Module):
 
         return logits, loss
 
-    # TODO Look at this block
+
     def crop_block_size(self, block_size):
         # model surgery to decrease the block size if necessary
         # e.g. we may load the GPT2 pretrained model checkpoint (block size 1024)
         # but want to use a smaller block size for some smaller, simpler model
         assert block_size <= self.config.block_size
         self.config.block_size = block_size
-        self.transformer["wpe"].weight = nn.Parameter(self.transformer["wpe"].weight[:block_size])
+        self.transformer["wpe"].weight = self.transformer["wpe"].weight[:block_size]
         for block in self.transformer["h"]:
             if hasattr(block.attn, 'bias'):
                 block.attn.bias = block.attn.bias[:, :, :block_size, :block_size]
@@ -306,6 +309,7 @@ class GPT(eqx.Module):
         # create a from-scratch initialized minGPT model
         config = GPTConfig(**config_args)
         model = GPT(config)
+        # TODO: Complete this module from here onwards
         sd = model.state_dict()
         sd_keys = sd.keys()
         sd_keys = [k for k in sd_keys if not k.endswith('.attn.bias')]  # discard this mask / buffer, not a param
@@ -347,8 +351,8 @@ class GPT(eqx.Module):
         # separate out all parameters to those that will and won't experience regularizing weight decay
         decay = set()
         no_decay = set()
-        whitelist_weight_modules = (torch.nn.Linear,)
-        blacklist_weight_modules = (torch.nn.LayerNorm, LayerNorm, torch.nn.Embedding)
+        whitelist_weight_modules = (eqx.nn.Linear,)
+        blacklist_weight_modules = (eqx.nn.LayerNorm, eqx.nn.LayerNorm, eqx.nn.Embedding)
         for mn, m in self.named_modules():
             for pn, p in m.named_parameters():
                 fpn = '%s.%s' % (mn, pn) if mn else pn  # full param name
@@ -411,29 +415,31 @@ class GPT(eqx.Module):
         mfu = flops_achieved / flops_promised
         return mfu
 
-    @torch.no_grad()
     def generate(self, idx, max_new_tokens, temperature=1.0, top_k=None):
         """
         Take a conditioning sequence of indices idx (LongTensor of shape (b,t)) and complete
         the sequence max_new_tokens times, feeding the predictions back into the model each time.
-        Most likely you'll want to make sure to be in model.eval() mode of operation for this.
         """
+        idx = jax.lax.stop_gradient(idx)
+
         for _ in range(max_new_tokens):
             # if the sequence context is growing too long we must crop it at block_size
-            idx_cond = idx if idx.size(1) <= self.config.block_size else idx[:, -self.config.block_size:]
+            idx_cond = idx if idx.shape[1] <= self.config.block_size else idx[:, -self.config.block_size:]
             # forward the model to get the logits for the index in the sequence
             logits, _ = self(idx_cond)
             # pluck the logits at the final step and scale by desired temperature
             logits = logits[:, -1, :] / temperature
             # optionally crop the logits to only the top k options
             if top_k is not None:
-                v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
+                v, _ = lax.top_k(logits, min(top_k, logits.shape[-1]))
                 logits[logits < v[:, [-1]]] = -float('Inf')
-            # apply softmax to convert logits to (normalized) probabilities
-            probs = F.softmax(logits, dim=-1)
             # sample from the distribution
-            idx_next = torch.multinomial(probs, num_samples=1)
+            idx_next = jax.random.categorical(jax.random.PRNGKey(0), logits, shape=(1, ))
             # append sampled index to the running sequence and continue
-            idx = torch.cat((idx, idx_next), dim=1)
+            idx = jnp.concatenate((idx, idx_next), axis=1)
 
         return idx
+
+    @jax.jit
+    def __call__(self, idx, targets=None):
+        self.forward(idx, targets)
