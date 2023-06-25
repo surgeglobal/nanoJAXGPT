@@ -124,12 +124,12 @@ class Block(eqx.Module):
     ln_1: eqx.nn.LayerNorm
     ln_2: eqx.nn.LayerNorm
 
-    def __init__(self, config):
+    def __init__(self, config, key):
         super().__init__()
         self.ln_1 = eqx.nn.LayerNorm(config.n_embd, use_bias=config.bias)
-        self.attn = CausalSelfAttention(config)
+        self.attn = CausalSelfAttention(config, key)
         self.ln_2 = eqx.nn.LayerNorm(config.n_embd, use_bias=config.bias)
-        self.mlp = MLP(config)
+        self.mlp = MLP(config, key)
 
     def forward(self, x):
         ln1 = jax.vmap(self.ln_1)(x)
@@ -171,7 +171,7 @@ class GPT(eqx.Module):
             wte=eqx.nn.Embedding(config.vocab_size, config.n_embd, key=ekey1),
             wpe=eqx.nn.Embedding(config.block_size, config.n_embd, key=ekey2),
             drop=eqx.nn.Dropout(config.dropout),
-            h=[Block(config) for _ in range(config.n_layer)],
+            h=[Block(config, key) for _ in range(config.n_layer)],
             ln_f=eqx.nn.LayerNorm(config.n_embd, bias=config.bias),
         )
         self.lm_head = eqx.nn.Linear(config.n_embd, config.vocab_size, use_bias=False, key=lmhkey)
@@ -283,7 +283,7 @@ class GPT(eqx.Module):
                 block.attn.bias = block.attn.bias[:, :, :block_size, :block_size]
 
     @classmethod
-    def from_pretrained(cls, model_type, override_args=None):
+    def from_pretrained(cls, model_type, key, override_args=None):
         assert model_type in {'gpt2', 'gpt2-medium', 'gpt2-large', 'gpt2-xl'}
         override_args = override_args or {}  # default to empty dict
         # only dropout can be overridden see more notes below
@@ -308,7 +308,7 @@ class GPT(eqx.Module):
             config_args['dropout'] = override_args['dropout']
         # create a from-scratch initialized minGPT model
         config = GPTConfig(**config_args)
-        model = GPT(config)
+        model = GPT(config, key)
         # TODO: Complete this module from here onwards
         sd = model.state_dict()
         sd_keys = sd.keys()
