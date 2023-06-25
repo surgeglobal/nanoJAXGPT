@@ -182,7 +182,7 @@ class GPT(eqx.Module):
         self.transformer["wte"].weight = self.lm_head.weight  # https://paperswithcode.com/method/weight-tying
 
         # init all weights
-        self._init_weights(self)
+        self._init_weights(self, key)
         # apply special scaled init to the residual projections, per GPT-2 paper
         for path, p in jax.tree_util.tree_flatten_with_path(self)[0]:
             pn = ''
@@ -212,7 +212,7 @@ class GPT(eqx.Module):
         return n_params
 
     @staticmethod
-    def _init_weights(model: eqx.Module, key: jax.random.PRNGKey = jax.random.PRNGKey(0)):
+    def _init_weights(model: eqx.Module, key: jax.random.PRNGKey):
         def init_layer(model, is_layer: Callable, mean: float, std: float):
             get_weights = lambda m: [x.weight
                                      for x in jax.tree_util.tree_leaves(m, is_leaf=is_layer)
@@ -269,7 +269,6 @@ class GPT(eqx.Module):
             loss = None
 
         return logits, loss
-
 
     def crop_block_size(self, block_size):
         # model surgery to decrease the block size if necessary
