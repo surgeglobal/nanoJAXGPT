@@ -23,9 +23,7 @@ from helpers import init
 
 from typing import Callable
 
-
-@jax.jit
-def swiglu(x):
+class SwiGLU(eqx.Module):
     """
     Implementation of the SwiGLU activation function in the paper by Noam Shazeer at Google
 
@@ -33,9 +31,21 @@ def swiglu(x):
         GLU Variants Improve Transformer paper  : https://arxiv.org/abs/2002.05202
         PaLM-pytorch repo by lucidrains         : https://github.com/lucidrains/PaLM-pytorch/blob/main/palm_pytorch/palm_pytorch.py
     """
-    assert x.shape[-1] % 2 == 0
-    x, gate = jnp.split(x, 2, axis=-1)
-    return nn.swish(gate) * x
+
+    W: jnp.ndarray
+    V: jnp.ndarray
+    b: jnp.ndarray
+    c: jnp.ndarray
+
+    def __init__(self, dim_in, dim_out, key):
+        k1, k2, k3, k4 = jax.random.split(key, 4)
+        self.W = jax.random.normal(k1, (dim_in, dim_out))
+        self.V = jax.random.normal(k2, (dim_in, dim_out))
+        self.b = jax.random.normal(k3, (dim_out,))
+        self.c = jax.random.normal(k4, (dim_out,))
+
+    def __call__(self, x):
+        return nn.swish(jnp.dot(x, self.W) + self.b) * (jnp.dot(x, self.V) + self.c)
 
 class CausalSelfAttention(eqx.Module):
     c_attn: eqx.nn.Linear
