@@ -105,12 +105,13 @@ class MLP(eqx.Module):
         super().__init__()
         lkey1, lkey2 = jax.random.split(key, 2)
         self.c_fc = eqx.nn.Linear(config.n_embd, 4 * config.n_embd, use_bias=config.bias, key=lkey1)
+        self.swiglu = swiglu
         self.c_proj = eqx.nn.Linear(4 * config.n_embd, config.n_embd, use_bias=config.bias, key=lkey2)
         self.dropout = eqx.nn.Dropout(config.dropout)
 
     def forward(self, x):
         x = self.c_fc(x)
-        x = new_gelu(x)
+        x = self.swiglu(x)
         x = self.c_proj(x)
         x = self.dropout(x)
         return x
