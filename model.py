@@ -91,7 +91,6 @@ class CausalSelfAttention(eqx.Module):
         y = jax.vmap(self.resid_dropout)(jax.vmap(self.c_proj)(y))
         return y
 
-    @jax.jit
     def __call__(self, x):
         return self.forward(x)
 
@@ -116,7 +115,6 @@ class MLP(eqx.Module):
         x = self.dropout(x)
         return x
 
-    @jax.jit
     def __call__(self, x):
         self.forward(x)
 
@@ -138,10 +136,6 @@ class Block(eqx.Module):
         ln2 = jax.vmap(self.ln_2)(x)
         x = x + jax.vmap(self.mlp)(ln2)
         return x
-
-    @jax.jit
-    def __call__(self, x):
-        return self.forward(x)
 
     def __call__(self, x):
         return self.forward(x)
@@ -440,6 +434,5 @@ class GPT(eqx.Module):
 
         return idx
 
-    @jax.jit
     def __call__(self, idx, targets=None):
         self.forward(idx, targets)
