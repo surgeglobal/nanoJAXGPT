@@ -29,13 +29,13 @@ class SwiGLU(eqx.Module):
 
     References:
         GLU Variants Improve Transformer paper  : https://arxiv.org/abs/2002.05202
-        PaLM-pytorch repo by lucidrains         : https://github.com/lucidrains/PaLM-pytorch/blob/main/palm_pytorch/palm_pytorch.py
+        Aziz et al. Paper Summaries             : https://azizbelaweid.substack.com/p/what-is-swiglu-how-to-implement-it
     """
 
-    W: jnp.ndarray
-    V: jnp.ndarray
-    b: jnp.ndarray
-    c: jnp.ndarray
+    W: jax.Array
+    V: jax.Array
+    b: jax.Array
+    c: jax.Array
 
     def __init__(self, dim_in, dim_out, key):
         k1, k2, k3, k4 = jax.random.split(key, 4)
