@@ -23,9 +23,7 @@ from helpers import init
 
 from typing import Callable
 
-
-@jax.jit
-def swiglu(x):
+class SwiGLU(eqx.Module):
     """
     Implementation of the SwiGLU activation function in the paper by Noam Shazeer at Google
 
@@ -33,9 +31,21 @@ def swiglu(x):
         GLU Variants Improve Transformer paper  : https://arxiv.org/abs/2002.05202
         PaLM-pytorch repo by lucidrains         : https://github.com/lucidrains/PaLM-pytorch/blob/main/palm_pytorch/palm_pytorch.py
     """
-    assert x.shape[-1] % 2 == 0
-    x, gate = jnp.split(x, 2, axis=-1)
-    return nn.swish(gate) * x
+
+    W: jnp.ndarray
+    V: jnp.ndarray
+    b: jnp.ndarray
+    c: jnp.ndarray
+
+    def __init__(self, dim_in, dim_out, key):
+        k1, k2, k3, k4 = jax.random.split(key, 4)
+        self.W = jax.random.normal(k1, (dim_in, dim_out))
+        self.V = jax.random.normal(k2, (dim_in, dim_out))
+        self.b = jax.random.normal(k3, (dim_out,))
+        self.c = jax.random.normal(k4, (dim_out,))
+
+    def __call__(self, x):
+        return nn.swish(jnp.dot(x, self.W) + self.b) * (jnp.dot(x, self.V) + self.c)
 
 class CausalSelfAttention(eqx.Module):
     c_attn: eqx.nn.Linear
@@ -97,14 +107,15 @@ class CausalSelfAttention(eqx.Module):
 
 class MLP(eqx.Module):
     c_fc: eqx.nn.Linear
+    swiglu: SwiGLU
     c_proj: eqx.nn.Linear
     dropout: eqx.nn.Dropout
 
     def __init__(self, config, key):
         super().__init__()
-        lkey1, lkey2 = jax.random.split(key, 2)
+        lkey1, lkey2, skey = jax.random.split(key, 3)
         self.c_fc = eqx.nn.Linear(config.n_embd, 4 * config.n_embd, use_bias=config.bias, key=lkey1)
-        self.swiglu = swiglu
+        self.swiglu = SwiGLU(4 * config.n_embd, 4 * config.n_embd, skey)
         self.c_proj = eqx.nn.Linear(4 * config.n_embd, config.n_embd, use_bias=config.bias, key=lkey2)
         self.dropout = eqx.nn.Dropout(config.dropout)
 
