@@ -54,7 +54,6 @@ class CausalSelfAttention(eqx.Module):
     resid_dropout: eqx.nn.Dropout
 
     def __init__(self, config, key):
-        super().__init__()
         assert config.n_embd % config.n_head == 0
 
         # PRNGKey
@@ -112,7 +111,6 @@ class MLP(eqx.Module):
     dropout: eqx.nn.Dropout
 
     def __init__(self, config, key):
-        super().__init__()
         lkey1, lkey2, skey = jax.random.split(key, 3)
         self.c_fc = eqx.nn.Linear(config.n_embd, 4 * config.n_embd, use_bias=config.bias, key=lkey1)
         self.swiglu = SwiGLU(4 * config.n_embd, 4 * config.n_embd, skey)
@@ -135,7 +133,6 @@ class Block(eqx.Module):
     ln_2: eqx.nn.LayerNorm
 
     def __init__(self, config, key):
-        super().__init__()
         self.ln_1 = eqx.nn.LayerNorm(config.n_embd, use_bias=config.bias)
         self.attn = CausalSelfAttention(config, key)
         self.ln_2 = eqx.nn.LayerNorm(config.n_embd, use_bias=config.bias)
@@ -166,7 +163,6 @@ class GPTConfig:
 class GPT(eqx.Module):
 
     def __init__(self, config, key):
-        super().__init__()
         # TODO: Refine the keys to be generic and not specific
         ekey1, ekey2, lmhkey, key4 = jax.random.split(key, 4)
         assert config.vocab_size is not None
