@@ -112,6 +112,7 @@ class MLP(eqx.Module):
 
     def __init__(self, config, key):
         lkey1, lkey2, skey = jax.random.split(key, 3)
+
         self.c_fc = eqx.nn.Linear(config.n_embd, 4 * config.n_embd, use_bias=config.bias, key=lkey1)
         self.swiglu = SwiGLU(4 * config.n_embd, 4 * config.n_embd, skey)
         self.c_proj = eqx.nn.Linear(4 * config.n_embd, config.n_embd, use_bias=config.bias, key=lkey2)
@@ -133,10 +134,12 @@ class Block(eqx.Module):
     ln_2: eqx.nn.LayerNorm
 
     def __init__(self, config, key):
+        ckey, mkey = jax.random.split(key, 2)
+
         self.ln_1 = eqx.nn.LayerNorm(config.n_embd, use_bias=config.bias)
-        self.attn = CausalSelfAttention(config, key)
+        self.attn = CausalSelfAttention(config, ckey)
         self.ln_2 = eqx.nn.LayerNorm(config.n_embd, use_bias=config.bias)
-        self.mlp = MLP(config, key)
+        self.mlp = MLP(config, mkey)
 
     def forward(self, x):
         ln1 = jax.vmap(self.ln_1)(x)
