@@ -75,7 +75,7 @@ class CausalSelfAttention(eqx.Module):
         self.bias = jnp.tril(jnp.ones(config.block_size, config.block_size)).reshape(1, 1, config.block_size,
                                                                                      config.block_size)
 
-    def forward(self, x):
+    def __call__(self, x):
         B, T, C = jnp.shape(x)  # batch size, sequence length, embedding dimensionality (n_embd)
 
         # calculate query, key, values for all heads in batch and move head forward to be the batch dim
@@ -100,9 +100,6 @@ class CausalSelfAttention(eqx.Module):
         y = jax.vmap(self.resid_dropout)(jax.vmap(self.c_proj)(y))
         return y
 
-    def __call__(self, x):
-        return self.forward(x)
-
 
 class MLP(eqx.Module):
     c_fc: eqx.nn.Linear
@@ -118,15 +115,12 @@ class MLP(eqx.Module):
         self.c_proj = eqx.nn.Linear(4 * config.n_embd, config.n_embd, use_bias=config.bias, key=lkey2)
         self.dropout = eqx.nn.Dropout(config.dropout)
 
-    def forward(self, x):
+    def __call__(self, x):
         x = self.c_fc(x)
         x = self.swiglu(x)
         x = self.c_proj(x)
         x = self.dropout(x)
         return x
-
-    def __call__(self, x):
-        self.forward(x)
 
 
 class Block(eqx.Module):
@@ -141,15 +135,12 @@ class Block(eqx.Module):
         self.ln_2 = eqx.nn.LayerNorm(config.n_embd, use_bias=config.bias)
         self.mlp = MLP(config, mkey)
 
-    def forward(self, x):
-        ln1 = jax.vmap(self.ln_1)(x)
-        x = x + jax.vmap(self.attn)(ln1)
-        ln2 = jax.vmap(self.ln_2)(x)
-        x = x + jax.vmap(self.mlp)(ln2)
-        return x
-
     def __call__(self, x):
-        return self.forward(x)
+        ln1 = self.ln_1(x)
+        x = x + self.attn(ln1)
+        ln2 = self.ln_2(x)
+        x = x + self.mlp(ln2)
+        return x
 
 
 @dataclass
@@ -251,7 +242,7 @@ class GPT(eqx.Module):
         model = init_linear(model)
         model = init_embedding(model)
 
-    def forward(self, idx, targets=None):
+    def __call__(self, idx, targets=None):
         b, t = idx.shape # TODO Check what idx is sent
         assert t <= self.config.block_size, f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
         pos = jnp.expand_dims(jnp.arange(0, t, dtype=jnp.int64), 0) # shape (1, t)
@@ -443,6 +434,3 @@ class GPT(eqx.Module):
             idx = jnp.concatenate((idx, idx_next), axis=1)
 
         return idx
-
-    def __call__(self, idx, targets=None):
-        self.forward(idx, targets)
