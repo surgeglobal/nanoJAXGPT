@@ -77,17 +77,17 @@ class CausalSelfAttention(eqx.Module):
                                                                                      config.block_size)
 
     def __call__(self, x):
-        B, T, C = jnp.shape(x)  # batch size, sequence length, embedding dimensionality (n_embd)
+        T, C = jnp.shape(x)  # sequence length, embedding dimensionality (n_embd)
 
         # calculate query, key, values for all heads in batch and move head forward to be the batch dim
         q, k, v = jnp.split(self.c_attn(x), self.n_embd, axis=2)
         # Immutability calls for reshape, plus there is no view for jnp (or numpy) arrays.
-        k = k.reshape(B, T, self.n_head, C // self.n_head).transpose(1, 2)  # (B, nh, T, hs)
-        q = q.reshape(B, T, self.n_head, C // self.n_head).transpose(1, 2)  # (B, nh, T, hs)
-        v = v.reshape(B, T, self.n_head, C // self.n_head).transpose(1, 2)  # (B, nh, T, hs)
+        k = jnp.swapaxes(k.reshape(T, self.n_head, C // self.n_head), 0, 1)  # (B, nh, T, hs)
+        q = jnp.swapaxes(q.reshape(T, self.n_head, C // self.n_head), 0, 1)  # (B, nh, T, hs)
+        v = jnp.swapaxes(v.reshape(T, self.n_head, C // self.n_head), 0, 1)  # (B, nh, T, hs)
 
         # manual implementation of attention
-        att = jnp.matmul(q, jnp.swapaxes(k, -2, -1)) / jnp.sqrt(jnp.shape(k)[-1])
+        att = jnp.matmul(q, jnp.swapaxes(k, -2, -1)) / math.sqrt(jnp.shape(k)[-1])
         # Note: Added the stop_gradient just to be safe, I see no update rule acting on the bias inside the
         # forward pass.
         att = jnp.where(lax.stop_gradient(self.bias[:, :, :T, :T]) == 0, float('-inf'), att)
@@ -95,7 +95,7 @@ class CausalSelfAttention(eqx.Module):
         att = self.attn_dropout(att)
         y = jnp.matmul(att, v)  # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
         # Reshaping with Immutability creates a new copy
-        y = y.transpose(1, 2).reshape(B, T, C)  # re-assemble all head outputs side by side
+        y = jnp.swapaxes(y, 1, 2).reshape(T, C)  # re-assemble all head outputs side by side
 
         # output projection
         y = self.resid_dropout(self.c_proj(y))
@@ -137,10 +137,8 @@ class Block(eqx.Module):
         self.mlp = MLP(config, mkey)
 
     def __call__(self, x):
-        ln1 = self.ln_1(x)
-        x = x + self.attn(ln1)
-        ln2 = self.ln_2(x)
-        x = x + self.mlp(ln2)
+        x = x + self.attn(self.ln_1(x))
+        x = x + self.mlp(self.ln_2(x))
         return x
 
 
@@ -158,18 +156,18 @@ class GPTConfig:
 class GPT(eqx.Module):
 
     def __init__(self, config, key):
-        # TODO: Refine the keys to be generic and not specific
         ekey1, ekey2, lmhkey, key4 = jax.random.split(key, 4)
+
         assert config.vocab_size is not None
         assert config.block_size is not None
         self.config = config
 
         self.transformer = dict(
-            wte=eqx.nn.Embedding(config.vocab_size, config.n_embd, key=ekey1),
-            wpe=eqx.nn.Embedding(config.block_size, config.n_embd, key=ekey2),
-            drop=eqx.nn.Dropout(config.dropout),
-            h=[Block(config, key) for _ in range(config.n_layer)],
-            ln_f=eqx.nn.LayerNorm(config.n_embd, bias=config.bias),
+            wte     = eqx.nn.Embedding(config.vocab_size, config.n_embd, key=ekey1),
+            wpe     = eqx.nn.Embedding(config.block_size, config.n_embd, key=ekey2),
+            drop    = eqx.nn.Dropout(config.dropout),
+            h       = [Block(config, key) for _ in range(config.n_layer)],
+            ln_f    = eqx.nn.LayerNorm(config.n_embd, bias=config.bias),
         )
         self.lm_head = eqx.nn.Linear(config.n_embd, config.vocab_size, use_bias=False, key=lmhkey)
         # with weight tying when using torch.compile() some warnings get generated:
@@ -179,7 +177,9 @@ class GPT(eqx.Module):
         self.transformer["wte"].weight = self.lm_head.weight  # https://paperswithcode.com/method/weight-tying
 
         # init all weights
-        self._init_weights(self, key)
+        model = self._apply(self._init_weights, key)
+        eqx.apply_updates(self, model)
+
         # apply special scaled init to the residual projections, per GPT-2 paper
         for path, p in jax.tree_util.tree_flatten_with_path(self)[0]:
             pn = ''
@@ -207,6 +207,9 @@ class GPT(eqx.Module):
         if non_embedding:
             n_params -= jnp.prod(self.transformer["wpe"].weight.shape)
         return n_params
+    
+    def _apply(self, fun, key):
+        return fun(self, key)
 
     @staticmethod
     def _init_weights(model: eqx.Module, key: jax.random.PRNGKey):
@@ -240,8 +243,10 @@ class GPT(eqx.Module):
 
             return init_layer(model, is_embedding, mean=0.0, std=0.2)
 
-        model = init_linear(model)
-        model = init_embedding(model)
+        initialized_model = init_linear(model)
+        initialized_model = init_embedding(initialized_model)
+
+        eqx.apply_updates(model, initialized_model)
 
     def __call__(self, idx, targets=None):
         b, t = idx.shape # TODO Check what idx is sent
