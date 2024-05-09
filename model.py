@@ -182,6 +182,26 @@ class GPT(eqx.Module):
         
         self.lm_head = eqx.nn.Linear(config.n_embd, config.vocab_size, use_bias=False, key=lmhkey)
 
+
+        # for path, p in jax.tree_util.tree_flatten_with_path(self, is_leaf=lambda x: isinstance(x, eqx.nn.Linear))[0]:
+        #     pn = ''
+
+        #     for index in range(len(path)):
+        #         if isinstance(path[index], jax._src.tree_util.DictKey):
+        #             pn += '.' + path[index].key
+        #         else:
+        #             pn += str(path[index])
+            
+        #     if isinstance(p, eqx.nn.Linear):
+        #         print(type(p))
+        
+        # for x in jax.tree_util.tree_leaves(self):
+        #     print(dir(x))
+
+        # for x in jax.tree_util.tree_flatten_with_path(self, is_leaf=lambda x: isinstance(x, eqx.nn.Linear)):
+        #     if isinstance(x, eqx.nn.Linear):
+        #         print(x)
+    
         # report number of parameters
         print("number of parameters: %.2fM" % (self.get_num_params() / 1e6,))
     
@@ -265,9 +285,9 @@ class GPT(eqx.Module):
         return initialized_model
 
     @staticmethod
-    def find_sub_tree(model: eqx.Module, sub_tree_name: str):
+    def find_sub_tree(model: eqx.Module, sub_tree_name: str, filter_fn: Callable = None):
         out = []
-        for path, p in jax.tree_util.tree_flatten_with_path(model)[0]:
+        for path, p in jax.tree_util.tree_flatten_with_path(model, is_leaf=filter_fn)[0]:
             pn = ''
 
             for index in range(len(path)):
@@ -276,7 +296,10 @@ class GPT(eqx.Module):
                 else:
                     pn += str(path[index])
 
-            if pn.endswith(sub_tree_name):
+            if filter_fn:
+                if filter_fn(p) and pn.endswith(sub_tree_name):
+                    out.append(p)
+            elif pn.endswith(sub_tree_name):
                 out.append(p)
         
         return out
@@ -383,25 +406,33 @@ class GPT(eqx.Module):
         """
 
         # separate out all parameters to those that will and won't experience regularizing weight decay
-        decay = set()
-        no_decay = set()
         whitelist_weight_modules = (eqx.nn.Linear,)
         blacklist_weight_modules = (eqx.nn.LayerNorm, eqx.nn.LayerNorm, eqx.nn.Embedding)
-        for mn, m in self.named_modules():
-            for pn, p in m.named_parameters():
-                fpn = '%s.%s' % (mn, pn) if mn else pn  # full param name
-                # random note: because named_modules and named_parameters are recursive
-                # we will see the same tensors p many many times. but doing it this way
-                # allows us to know which parent module any tensor p belongs to...
-                if pn.endswith('bias'):
-                    # all biases will not be decayed
-                    no_decay.add(fpn)
-                elif pn.endswith('weight') and isinstance(m, whitelist_weight_modules):
-                    # weights of whitelist modules will be weight decayed
-                    decay.add(fpn)
-                elif pn.endswith('weight') and isinstance(m, blacklist_weight_modules):
-                    # weights of blacklist modules will NOT be weight decayed
-                    no_decay.add(fpn)
+        decay = set(GPT.find_sub_tree(self, "weight", filter_fn=lambda x: any(isinstance(x, w) for w in whitelist_weight_modules)))
+        no_decay = set(
+            GPT.find_sub_tree(self, "bias").extend(
+                GPT.find_sub_tree(self, "weight", filter_fn=lambda x: any(isinstance(x, b) for b in blacklist_weight_modules))
+            )
+        )
+
+        
+        # for mn, m in self.named_modules():
+        #     for pn, p in m.named_parameters():
+        #         fpn = '%s.%s' % (mn, pn) if mn else pn  # full param name
+        #         # random note: because named_modules and named_parameters are recursive
+        #         # we will see the same tensors p many many times. but doing it this way
+        #         # allows us to know which parent module any tensor p belongs to...
+        #         if pn.endswith('bias'):
+        #             # all biases will not be decayed
+        #             no_decay.add(fpn)
+        #         elif pn.endswith('weight') and isinstance(m, whitelist_weight_modules):
+        #             # weights of whitelist modules will be weight decayed
+        #             decay.add(fpn)
+        #         elif pn.endswith('weight') and isinstance(m, blacklist_weight_modules):
+        #             # weights of blacklist modules will NOT be weight decayed
+        #             no_decay.add(fpn)
+        
+
 
         # subtle: 'transformer.wte.weight' and 'lm_head.weight' are tied, so they
         # will appear in the no_decay and decay sets respectively after the above.
