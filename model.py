@@ -17,11 +17,12 @@ import jax.numpy as jnp
 import jax.nn as nn
 import jax.tree_util as jtu
 import equinox as eqx
+import equinox.nn as nn
 import optax
 
 from helpers import init
 
-from typing import Callable
+from typing import Callable, List
 
 class SwiGLU(eqx.Module):
     """
@@ -48,11 +49,24 @@ class SwiGLU(eqx.Module):
     def __call__(self, x):
         return nn.swish(jnp.dot(x, self.W) + self.b) * (jnp.dot(x, self.V) + self.c)
 
+@dataclass
+class GPTConfig:
+    block_size: int = 1024
+    vocab_size: int = 50304  # GPT-2 vocab_size of 50257, padded up to nearest multiple of 64 for efficiency
+    n_layer: int = 12
+    n_head: int = 12
+    n_embd: int = 768
+    dropout: float = 0.0
+    bias: bool = True  # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
+
 class CausalSelfAttention(eqx.Module):
     c_attn: eqx.nn.Linear
     c_proj: eqx.nn.Linear
     attn_dropout: eqx.nn.Dropout
     resid_dropout: eqx.nn.Dropout
+    bias: jax.Array
+    
+    _config: GPTConfig = eqx.field(static=True)
 
     def __init__(self, config, key):
         assert config.n_embd % config.n_head == 0
@@ -67,24 +81,22 @@ class CausalSelfAttention(eqx.Module):
         # regularization
         self.attn_dropout = eqx.nn.Dropout(config.dropout)
         self.resid_dropout = eqx.nn.Dropout(config.dropout)
-        self.n_head = config.n_head
-        self.n_embd = config.n_embd
-        self.dropout = config.dropout
+        self._config = config
         # causal mask to ensure that attention is only applied to the left in the input sequence
         # Has been made a buffer by using lax.stop_gradient whenever it is used.
         # Immutability calls for reshape, plus there is no view for jnp (or numpy) arrays.
-        self.bias = jnp.tril(jnp.ones(config.block_size, config.block_size)).reshape(1, 1, config.block_size,
+        self.bias = jnp.tril(jnp.ones((config.block_size, config.block_size))).reshape(1, 1, config.block_size,
                                                                                      config.block_size)
 
     def __call__(self, x):
         T, C = jnp.shape(x)  # sequence length, embedding dimensionality (n_embd)
 
         # calculate query, key, values for all heads in batch and move head forward to be the batch dim
-        q, k, v = jnp.split(self.c_attn(x), self.n_embd, axis=2)
+        q, k, v = jnp.split(self.c_attn(x), self._config.n_embd, axis=2)
         # Immutability calls for reshape, plus there is no view for jnp (or numpy) arrays.
-        k = jnp.swapaxes(k.reshape(T, self.n_head, C // self.n_head), 0, 1)  # (B, nh, T, hs)
-        q = jnp.swapaxes(q.reshape(T, self.n_head, C // self.n_head), 0, 1)  # (B, nh, T, hs)
-        v = jnp.swapaxes(v.reshape(T, self.n_head, C // self.n_head), 0, 1)  # (B, nh, T, hs)
+        k = jnp.swapaxes(k.reshape(T, self._config.n_head, C // self._config.n_head), 0, 1)  # (B, nh, T, hs)
+        q = jnp.swapaxes(q.reshape(T, self._config.n_head, C // self._config.n_head), 0, 1)  # (B, nh, T, hs)
+        v = jnp.swapaxes(v.reshape(T, self._config.n_head, C // self._config.n_head), 0, 1)  # (B, nh, T, hs)
 
         # manual implementation of attention
         att = jnp.matmul(q, jnp.swapaxes(k, -2, -1)) / math.sqrt(jnp.shape(k)[-1])
@@ -128,6 +140,9 @@ class Block(eqx.Module):
     ln_1: eqx.nn.LayerNorm
     ln_2: eqx.nn.LayerNorm
 
+    attn: eqx.Module
+    mlp: eqx.Module
+
     def __init__(self, config, key):
         ckey, mkey = jax.random.split(key, 2)
 
@@ -142,60 +157,34 @@ class Block(eqx.Module):
         return x
 
 
-@dataclass
-class GPTConfig:
-    block_size: int = 1024
-    vocab_size: int = 50304  # GPT-2 vocab_size of 50257, padded up to nearest multiple of 64 for efficiency
-    n_layer: int = 12
-    n_head: int = 12
-    n_embd: int = 768
-    dropout: float = 0.0
-    bias: bool = True  # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
-
-
 class GPT(eqx.Module):
+    att_wte: eqx.nn.Embedding
+    att_wpe: eqx.nn.Embedding
+    att_drop: eqx.nn.Dropout
+    att_h: eqx.nn.Sequential
+    att_ln_f: eqx.nn.LayerNorm
+    lm_head: eqx.nn.Linear
+
+    _config: GPTConfig = eqx.field(static=True)
 
     def __init__(self, config, key):
         ekey1, ekey2, lmhkey, key4 = jax.random.split(key, 4)
 
         assert config.vocab_size is not None
         assert config.block_size is not None
-        self.config = config
+        self._config = config
 
-        self.transformer = dict(
-            wte     = eqx.nn.Embedding(config.vocab_size, config.n_embd, key=ekey1),
-            wpe     = eqx.nn.Embedding(config.block_size, config.n_embd, key=ekey2),
-            drop    = eqx.nn.Dropout(config.dropout),
-            h       = [Block(config, key) for _ in range(config.n_layer)],
-            ln_f    = eqx.nn.LayerNorm(config.n_embd, bias=config.bias),
-        )
+        self.att_wte = eqx.nn.Embedding(config.vocab_size, config.n_embd, key=ekey1)
+        self.att_wpe = eqx.nn.Embedding(config.block_size, config.n_embd, key=ekey2)
+        self.att_drop = eqx.nn.Dropout(config.dropout)
+        self.att_h = eqx.nn.Sequential([Block(config, key) for _ in range(config.n_layer)])
+        self.att_ln_f = eqx.nn.LayerNorm(config.n_embd, use_bias=config.bias)
+        
         self.lm_head = eqx.nn.Linear(config.n_embd, config.vocab_size, use_bias=False, key=lmhkey)
-        # with weight tying when using torch.compile() some warnings get generated:
-        # "UserWarning: functional_call was passed multiple values for tied weights.
-        # This behavior is deprecated and will be an error in future versions"
-        # not 100% sure what this is, so far seems to be harmless. TODO investigate
-        self.transformer["wte"].weight = self.lm_head.weight  # https://paperswithcode.com/method/weight-tying
-
-        # init all weights
-        model = self._apply(self._init_weights, key)
-        eqx.apply_updates(self, model)
-
-        # apply special scaled init to the residual projections, per GPT-2 paper
-        for path, p in jax.tree_util.tree_flatten_with_path(self)[0]:
-            pn = ''
-
-            for index in range(len(path)):
-                if isinstance(path[index], jax._src.tree_util.DictKey):
-                    pn += '.' + path[index].key
-                else:
-                    pn += '.' + path[index].name
-
-            if pn.endswith('c_proj.weight'):
-                init.normal_(p, mean=0.0, std=0.02 / math.sqrt(2 * config.n_layer), key=key4)
 
         # report number of parameters
         print("number of parameters: %.2fM" % (self.get_num_params() / 1e6,))
-
+    
     def get_num_params(self, non_embedding=True):
         """
         Return the number of parameters in the model.
@@ -203,24 +192,30 @@ class GPT(eqx.Module):
         The token embeddings would too, except due to the parameter sharing these
         params are actually used as weights in the final layer, so we include them.
         """
-        n_params = sum(jnp.prod(p.shape) for p in jax.tree_util.tree_leaves(self))
+        n_params = sum(jnp.prod(jnp.array(list(p.shape))) for p in jax.tree_util.tree_leaves(self) if type(p) != float and type(p) != bool)
         if non_embedding:
-            n_params -= jnp.prod(self.transformer["wpe"].weight.shape)
+            n_params -= jnp.prod(jnp.array(list(self.att_wpe.weight.shape)))
         return n_params
     
-    def _apply(self, fun, key):
-        return fun(self, key)
+    @staticmethod
+    def create_instance(config, key):
+        key1, key2 = jax.random.split(key, 2)
+
+        inst = GPT(config, key1)
+        new_inst = GPT._init_weights(inst, config, key2)
+
+        return new_inst
 
     @staticmethod
-    def _init_weights(model: eqx.Module, key: jax.random.PRNGKey):
+    def _init_weights(model: eqx.Module, config: GPTConfig, key: jax.random.PRNGKey):
         def init_layer(model, is_layer: Callable, mean: float, std: float):
             get_weights = lambda m: [x.weight
-                                     for x in jax.tree_util.tree_leaves(m, is_leaf=is_layer)
-                                     if is_layer(x)]
+                                        for x in jax.tree_util.tree_leaves(m, is_leaf=is_layer)
+                                        if is_layer(x)]
             weights = get_weights(model)
 
             new_weights = [init.normal_(weight, mean=mean, std=std, key=subkey)
-                           for weight, subkey in zip(weights, jax.random.split(key, len(weights)))]
+                            for weight, subkey in zip(weights, jax.random.split(key, len(weights)))]
 
             return eqx.tree_at(get_weights, model, new_weights)
 
@@ -242,24 +237,62 @@ class GPT(eqx.Module):
             is_embedding = lambda x: isinstance(x, eqx.nn.Embedding)
 
             return init_layer(model, is_embedding, mean=0.0, std=0.2)
+        
+        def init_att_wte_weights(model):
+            get_att_wte_weights = lambda m : GPT.find_sub_tree(m, "att_wte.weight")
+            get_lm_head_weights = lambda m : GPT.find_sub_tree(m, "lm_head.weight")
+
+            lm_head_weights = get_lm_head_weights(model)
+
+            return eqx.tree_at(get_att_wte_weights, model, lm_head_weights)
+        
+        def init_c_proj_weights_with_normal(model):
+            get_c_proj_weights = lambda m : GPT.find_sub_tree(m, "c_proj.weight")
+
+            old_weights = get_c_proj_weights(model)
+            new_weights = [init.normal_(weight, mean=0.0, std=0.02 / math.sqrt(2 * config.n_layer), key=subkey)
+                            for weight, subkey in zip(old_weights, jax.random.split(key, len(old_weights)))]
+
+            return eqx.tree_at(get_c_proj_weights, model, new_weights)
 
         initialized_model = init_linear(model)
         initialized_model = init_embedding(initialized_model)
+        # Update the att_wte weights
+        initialized_model = init_att_wte_weights(initialized_model)
+        # apply special scaled init to the residual projections, per GPT-2 paper
+        initialized_model = init_c_proj_weights_with_normal(initialized_model)
 
-        eqx.apply_updates(model, initialized_model)
+        return initialized_model
+
+    @staticmethod
+    def find_sub_tree(model: eqx.Module, sub_tree_name: str):
+        out = []
+        for path, p in jax.tree_util.tree_flatten_with_path(model)[0]:
+            pn = ''
+
+            for index in range(len(path)):
+                if isinstance(path[index], jax._src.tree_util.DictKey):
+                    pn += '.' + path[index].key
+                else:
+                    pn += str(path[index])
+
+            if pn.endswith(sub_tree_name):
+                out.append(p)
+        
+        return out
 
     def __call__(self, idx, targets=None):
         b, t = idx.shape # TODO Check what idx is sent
-        assert t <= self.config.block_size, f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
+        assert t <= self._config.block_size, f"Cannot forward sequence of length {t}, block size is only {self._config.block_size}"
         pos = jnp.expand_dims(jnp.arange(0, t, dtype=jnp.int64), 0) # shape (1, t)
 
         # forward the GPT model itself
-        tok_emb = self.transformer["wte"](idx)  # token embeddings of shape (b, t, n_embd)
-        pos_emb = self.transformer["wpe"](pos)  # position embeddings of shape (1, t, n_embd)
-        x = self.transformer["drop"](tok_emb + pos_emb)
-        for block in self.transformer["h"]:
+        tok_emb = self.att_wte(idx)  # token embeddings of shape (b, t, n_embd)
+        pos_emb = self.att_wpe(pos)  # position embeddings of shape (1, t, n_embd)
+        x = self.att_drop(tok_emb + pos_emb)
+        for block in self.att_h:
             x = block(x)
-        x = self.transformer["ln_f"](x)
+        x = self.att_ln_f(x)
 
         if targets is not None:
             # if we are given some desired targets also calculate the loss
@@ -276,70 +309,70 @@ class GPT(eqx.Module):
         # model surgery to decrease the block size if necessary
         # e.g. we may load the GPT2 pretrained model checkpoint (block size 1024)
         # but want to use a smaller block size for some smaller, simpler model
-        assert block_size <= self.config.block_size
-        self.config.block_size = block_size
-        self.transformer["wpe"].weight = self.transformer["wpe"].weight[:block_size]
-        for block in self.transformer["h"]:
+        assert block_size <= self._config.block_size
+        self._config.block_size = block_size
+        self.att_wpe.weight = self.att_wpe.weight[:block_size]
+        for block in self.att_h:
             if hasattr(block.attn, 'bias'):
                 block.attn.bias = block.attn.bias[:, :, :block_size, :block_size]
 
-    @classmethod
-    def from_pretrained(cls, model_type, key, override_args=None):
-        assert model_type in {'gpt2', 'gpt2-medium', 'gpt2-large', 'gpt2-xl'}
-        override_args = override_args or {}  # default to empty dict
-        # only dropout can be overridden see more notes below
-        assert all(k == 'dropout' for k in override_args)
-        from transformers import GPT2LMHeadModel
-        print("loading weights from pretrained gpt: %s" % model_type)
+    # @classmethod
+    # def from_pretrained(cls, model_type, key, override_args=None):
+    #     assert model_type in {'gpt2', 'gpt2-medium', 'gpt2-large', 'gpt2-xl'}
+    #     override_args = override_args or {}  # default to empty dict
+    #     # only dropout can be overridden see more notes below
+    #     assert all(k == 'dropout' for k in override_args)
+    #     from transformers import GPT2LMHeadModel
+    #     print("loading weights from pretrained gpt: %s" % model_type)
 
-        # n_layer, n_head and n_embd are determined from model_type
-        config_args = {
-            'gpt2': dict(n_layer=12, n_head=12, n_embd=768),  # 124M params
-            'gpt2-medium': dict(n_layer=24, n_head=16, n_embd=1024),  # 350M params
-            'gpt2-large': dict(n_layer=36, n_head=20, n_embd=1280),  # 774M params
-            'gpt2-xl': dict(n_layer=48, n_head=25, n_embd=1600),  # 1558M params
-        }[model_type]
-        print("forcing vocab_size=50257, block_size=1024, bias=True")
-        config_args['vocab_size'] = 50257  # always 50257 for GPT model checkpoints
-        config_args['block_size'] = 1024  # always 1024 for GPT model checkpoints
-        config_args['bias'] = True  # always True for GPT model checkpoints
-        # we can override the dropout rate, if desired
-        if 'dropout' in override_args:
-            print(f"overriding dropout rate to {override_args['dropout']}")
-            config_args['dropout'] = override_args['dropout']
-        # create a from-scratch initialized minGPT model
-        config = GPTConfig(**config_args)
-        model = GPT(config, key)
-        # TODO: Complete this module from here onwards
-        sd = model.state_dict()
-        sd_keys = sd.keys()
-        sd_keys = [k for k in sd_keys if not k.endswith('.attn.bias')]  # discard this mask / buffer, not a param
+    #     # n_layer, n_head and n_embd are determined from model_type
+    #     config_args = {
+    #         'gpt2': dict(n_layer=12, n_head=12, n_embd=768),  # 124M params
+    #         'gpt2-medium': dict(n_layer=24, n_head=16, n_embd=1024),  # 350M params
+    #         'gpt2-large': dict(n_layer=36, n_head=20, n_embd=1280),  # 774M params
+    #         'gpt2-xl': dict(n_layer=48, n_head=25, n_embd=1600),  # 1558M params
+    #     }[model_type]
+    #     print("forcing vocab_size=50257, block_size=1024, bias=True")
+    #     config_args['vocab_size'] = 50257  # always 50257 for GPT model checkpoints
+    #     config_args['block_size'] = 1024  # always 1024 for GPT model checkpoints
+    #     config_args['bias'] = True  # always True for GPT model checkpoints
+    #     # we can override the dropout rate, if desired
+    #     if 'dropout' in override_args:
+    #         print(f"overriding dropout rate to {override_args['dropout']}")
+    #         config_args['dropout'] = override_args['dropout']
+    #     # create a from-scratch initialized minGPT model
+    #     config = GPTConfig(**config_args)
+    #     model = GPT(config, key)
+    #     # TODO: Complete this module from here onwards
+    #     sd = model.state_dict()
+    #     sd_keys = sd.keys()
+    #     sd_keys = [k for k in sd_keys if not k.endswith('.attn.bias')]  # discard this mask / buffer, not a param
 
-        # init a huggingface/transformers model
-        model_hf = GPT2LMHeadModel.from_pretrained(model_type)
-        sd_hf = model_hf.state_dict()
+    #     # init a huggingface/transformers model
+    #     model_hf = GPT2LMHeadModel.from_pretrained(model_type)
+    #     sd_hf = model_hf.state_dict()
 
-        # copy while ensuring all of the parameters are aligned and match in names and shapes
-        sd_keys_hf = sd_hf.keys()
-        sd_keys_hf = [k for k in sd_keys_hf if not k.endswith('.attn.masked_bias')]  # ignore these, just a buffer
-        sd_keys_hf = [k for k in sd_keys_hf if not k.endswith('.attn.bias')]  # same, just the mask (buffer)
-        transposed = ['attn.c_attn.weight', 'attn.c_proj.weight', 'mlp.c_fc.weight', 'mlp.c_proj.weight']
-        # basically the openai checkpoints use a "Conv1D" module, but we only want to use a vanilla Linear
-        # this means that we have to transpose these weights when we import them
-        assert len(sd_keys_hf) == len(sd_keys), f"mismatched keys: {len(sd_keys_hf)} != {len(sd_keys)}"
-        for k in sd_keys_hf:
-            if any(k.endswith(w) for w in transposed):
-                # special treatment for the Conv1D weights we need to transpose
-                assert sd_hf[k].shape[::-1] == sd[k].shape
-                with torch.no_grad():
-                    sd[k].copy_(sd_hf[k].t())
-            else:
-                # vanilla copy over the other parameters
-                assert sd_hf[k].shape == sd[k].shape
-                with torch.no_grad():
-                    sd[k].copy_(sd_hf[k])
+    #     # copy while ensuring all of the parameters are aligned and match in names and shapes
+    #     sd_keys_hf = sd_hf.keys()
+    #     sd_keys_hf = [k for k in sd_keys_hf if not k.endswith('.attn.masked_bias')]  # ignore these, just a buffer
+    #     sd_keys_hf = [k for k in sd_keys_hf if not k.endswith('.attn.bias')]  # same, just the mask (buffer)
+    #     transposed = ['attn.c_attn.weight', 'attn.c_proj.weight', 'mlp.c_fc.weight', 'mlp.c_proj.weight']
+    #     # basically the openai checkpoints use a "Conv1D" module, but we only want to use a vanilla Linear
+    #     # this means that we have to transpose these weights when we import them
+    #     assert len(sd_keys_hf) == len(sd_keys), f"mismatched keys: {len(sd_keys_hf)} != {len(sd_keys)}"
+    #     for k in sd_keys_hf:
+    #         if any(k.endswith(w) for w in transposed):
+    #             # special treatment for the Conv1D weights we need to transpose
+    #             assert sd_hf[k].shape[::-1] == sd[k].shape
+    #             with torch.no_grad():
+    #                 sd[k].copy_(sd_hf[k].t())
+    #         else:
+    #             # vanilla copy over the other parameters
+    #             assert sd_hf[k].shape == sd[k].shape
+    #             with torch.no_grad():
+    #                 sd[k].copy_(sd_hf[k])
 
-        return model
+    #     return model
 
     def configure_optimizers(self, weight_decay, learning_rate, betas, device_type):
         """
@@ -405,7 +438,7 @@ class GPT(eqx.Module):
         # first estimate the number of flops we do per iteration.
         # see PaLM paper Appendix B as ref: https://arxiv.org/abs/2204.02311
         N = self.get_num_params()
-        cfg = self.config
+        cfg = self._config
         L, H, Q, T = cfg.n_layer, cfg.n_head, cfg.n_embd // cfg.n_head, cfg.block_size
         flops_per_token = 6 * N + 12 * L * H * Q * T
         flops_per_fwdbwd = flops_per_token * T
@@ -425,7 +458,7 @@ class GPT(eqx.Module):
 
         for _ in range(max_new_tokens):
             # if the sequence context is growing too long we must crop it at block_size
-            idx_cond = idx if idx.shape[1] <= self.config.block_size else idx[:, -self.config.block_size:]
+            idx_cond = idx if idx.shape[1] <= self._config.block_size else idx[:, -self._config.block_size:]
             # forward the model to get the logits for the index in the sequence
             logits, _ = self(idx_cond)
             # pluck the logits at the final step and scale by desired temperature
