@@ -94,9 +94,9 @@ class CausalSelfAttention(eqx.Module):
         # calculate query, key, values for all heads in batch and move head forward to be the batch dim
         q, k, v = jnp.split(self.c_attn(x), self._config.n_embd, axis=2)
         # Immutability calls for reshape, plus there is no view for jnp (or numpy) arrays.
-        k = jnp.swapaxes(k.reshape(T, self._config.n_head, C // self._config.n_head), 0, 1)  # (B, nh, T, hs)
-        q = jnp.swapaxes(q.reshape(T, self._config.n_head, C // self._config.n_head), 0, 1)  # (B, nh, T, hs)
-        v = jnp.swapaxes(v.reshape(T, self._config.n_head, C // self._config.n_head), 0, 1)  # (B, nh, T, hs)
+        k = jnp.swapaxes(k.reshape(T, self._config.n_head, C // self._config.n_head), 0, 1)  # (nh, T, hs)
+        q = jnp.swapaxes(q.reshape(T, self._config.n_head, C // self._config.n_head), 0, 1)  # (nh, T, hs)
+        v = jnp.swapaxes(v.reshape(T, self._config.n_head, C // self._config.n_head), 0, 1)  # (nh, T, hs)
 
         # manual implementation of attention
         att = jnp.matmul(q, jnp.swapaxes(k, -2, -1)) / math.sqrt(jnp.shape(k)[-1])
@@ -105,7 +105,7 @@ class CausalSelfAttention(eqx.Module):
         att = jnp.where(lax.stop_gradient(self.bias[:, :, :T, :T]) == 0, float('-inf'), att)
         att = jax.nn.softmax(att, axis=-1)
         att = self.attn_dropout(att)
-        y = jnp.matmul(att, v)  # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
+        y = jnp.matmul(att, v)  # (nh, T, T) x (nh, T, hs) -> (nh, T, hs)
         # Reshaping with Immutability creates a new copy
         y = jnp.swapaxes(y, 1, 2).reshape(T, C)  # re-assemble all head outputs side by side
 
