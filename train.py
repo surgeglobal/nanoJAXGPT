@@ -22,6 +22,8 @@ import math
 import pickle
 from contextlib import nullcontext
 
+import jax
+import jax.numpy as jnp
 import numpy as np
 import torch
 from torch.nn.parallel import DistributedDataParallel as DDP
@@ -54,7 +56,7 @@ wandb_run_name = 'gpt2'  # 'run' + str(time.time())
 dataset = 'openwebtext'
 gradient_accumulation_steps = 5 * 8  # used to simulate larger batch sizes
 batch_size = 12  # if gradient_accumulation_steps > 1, this is the micro-batch size
-block_size = 1024
+block_size = 1024 ### If block size is different to 1024, changes need to be made in GPT.crop_block_size() method
 # model
 n_layer = 12
 n_head = 12
@@ -122,16 +124,13 @@ train_data = np.memmap(os.path.join(data_dir, 'train.bin'), dtype=np.uint16, mod
 val_data = np.memmap(os.path.join(data_dir, 'val.bin'), dtype=np.uint16, mode='r')
 
 
-def get_batch(split):
+def get_batch(split, key: jax.random.PRNGKey = None):
     data = train_data if split == 'train' else val_data
-    ix = torch.randint(len(data) - block_size, (batch_size,))
-    x = torch.stack([torch.from_numpy((data[i:i + block_size]).astype(np.int64)) for i in ix])
-    y = torch.stack([torch.from_numpy((data[i + 1:i + 1 + block_size]).astype(np.int64)) for i in ix])
-    if device_type == 'cuda':
-        # pin arrays x,y, which allows us to move them to GPU asynchronously (non_blocking=True)
-        x, y = x.pin_memory().to(device, non_blocking=True), y.pin_memory().to(device, non_blocking=True)
-    else:
-        x, y = x.to(device), y.to(device)
+
+    ix = jax.random.randint(key, (batch_size,), 0, len(data) - block_size)
+    x = jnp.stack([jnp.array(data[i:i+block_size], dtype=jnp.int64) for i in ix])
+    y = jnp.stack([jnp.array(data[i+1:i+1+block_size], dtype=jnp.int64) for i in ix])
+    
     return x, y
 
 

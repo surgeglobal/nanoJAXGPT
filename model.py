@@ -14,13 +14,12 @@ from dataclasses import dataclass
 import jax
 from jax import lax
 import jax.numpy as jnp
-import jax.nn as nn
 import jax.tree_util as jtu
 import equinox as eqx
-import equinox.nn as nn
 import optax
 
 from helpers import init
+from helpers import eqx as eqx_helper
 
 from typing import Callable, List
 
@@ -47,7 +46,7 @@ class SwiGLU(eqx.Module):
         self.c = jax.random.normal(k4, (dim_out,))
 
     def __call__(self, x):
-        return nn.swish(jnp.dot(x, self.W) + self.b) * (jnp.dot(x, self.V) + self.c)
+        return jax.nn.swish(jnp.dot(x, self.W) + self.b) * (jnp.dot(x, self.V) + self.c)
 
 @dataclass
 class GPTConfig:
@@ -64,7 +63,7 @@ class CausalSelfAttention(eqx.Module):
     c_proj: eqx.nn.Linear
     attn_dropout: eqx.nn.Dropout
     resid_dropout: eqx.nn.Dropout
-    bias: jax.Array
+    bias: jax.Array = eqx.field(static=True)
     
     _config: GPTConfig = eqx.field(static=True)
 
@@ -85,14 +84,13 @@ class CausalSelfAttention(eqx.Module):
         # causal mask to ensure that attention is only applied to the left in the input sequence
         # Has been made a buffer by using lax.stop_gradient whenever it is used.
         # Immutability calls for reshape, plus there is no view for jnp (or numpy) arrays.
-        self.bias = jnp.tril(jnp.ones((config.block_size, config.block_size))).reshape(1, 1, config.block_size,
-                                                                                     config.block_size)
+        self.bias = jnp.tril(jnp.ones((config.block_size, config.block_size))).reshape(1, 1, config.block_size, config.block_size)
 
     def __call__(self, x):
         T, C = jnp.shape(x)  # sequence length, embedding dimensionality (n_embd)
 
         # calculate query, key, values for all heads in batch and move head forward to be the batch dim
-        q, k, v = jnp.split(self.c_attn(x), self._config.n_embd, axis=2)
+        q, k, v = jnp.split(jax.vmap(self.c_attn)(x), 3, axis=1)
         # Immutability calls for reshape, plus there is no view for jnp (or numpy) arrays.
         k = jnp.swapaxes(k.reshape(T, self._config.n_head, C // self._config.n_head), 0, 1)  # (nh, T, hs)
         q = jnp.swapaxes(q.reshape(T, self._config.n_head, C // self._config.n_head), 0, 1)  # (nh, T, hs)
@@ -110,7 +108,7 @@ class CausalSelfAttention(eqx.Module):
         y = jnp.swapaxes(y, 1, 2).reshape(T, C)  # re-assemble all head outputs side by side
 
         # output projection
-        y = self.resid_dropout(self.c_proj(y))
+        y = self.resid_dropout(jax.vmap(self.c_proj)(y))
         return y
 
 
@@ -129,19 +127,18 @@ class MLP(eqx.Module):
         self.dropout = eqx.nn.Dropout(config.dropout)
 
     def __call__(self, x):
-        x = self.c_fc(x)
-        x = self.swiglu(x)
-        x = self.c_proj(x)
+        x = jax.vmap(self.c_fc)(x)
+        x = jax.vmap(self.swiglu)(x)
+        x = jax.vmap(self.c_proj)(x)
         x = self.dropout(x)
         return x
 
 
 class Block(eqx.Module):
     ln_1: eqx.nn.LayerNorm
-    ln_2: eqx.nn.LayerNorm
-
-    attn: eqx.Module
-    mlp: eqx.Module
+    attn: CausalSelfAttention
+    ln_2: eqx.nn.LayerNorm    
+    mlp: MLP
 
     def __init__(self, config, key):
         ckey, mkey = jax.random.split(key, 2)
@@ -152,55 +149,63 @@ class Block(eqx.Module):
         self.mlp = MLP(config, mkey)
 
     def __call__(self, x):
-        x = x + self.attn(self.ln_1(x))
-        x = x + self.mlp(self.ln_2(x))
+        x = x + self.attn(jax.vmap(self.ln_1)(x))
+        x = x + self.mlp(jax.vmap(self.ln_2)(x))
         return x
 
-
-class GPT(eqx.Module):
-    att_wte: eqx.nn.Embedding
-    att_wpe: eqx.nn.Embedding
-    att_drop: eqx.nn.Dropout
-    att_h: eqx.nn.Sequential
-    att_ln_f: eqx.nn.LayerNorm
-    lm_head: eqx.nn.Linear
-
+class TransformerLayer(eqx.Module):
     _config: GPTConfig = eqx.field(static=True)
 
+    wte: eqx.nn.Embedding
+    wpe: eqx.nn.Embedding
+    drop: eqx.nn.Dropout
+    h: list
+    ln_f: eqx.nn.LayerNorm
+
     def __init__(self, config, key):
-        ekey1, ekey2, lmhkey, key4 = jax.random.split(key, 4)
+        ekey, pkey, hkey, fkey = jax.random.split(key, 4)
 
         assert config.vocab_size is not None
         assert config.block_size is not None
         self._config = config
 
-        self.att_wte = eqx.nn.Embedding(config.vocab_size, config.n_embd, key=ekey1)
-        self.att_wpe = eqx.nn.Embedding(config.block_size, config.n_embd, key=ekey2)
-        self.att_drop = eqx.nn.Dropout(config.dropout)
-        self.att_h = eqx.nn.Sequential([Block(config, key) for _ in range(config.n_layer)])
-        self.att_ln_f = eqx.nn.LayerNorm(config.n_embd, use_bias=config.bias)
+        self.wte = eqx.nn.Embedding(config.vocab_size, config.n_embd, key=ekey)
+        self.wpe = eqx.nn.Embedding(config.block_size, config.n_embd, key=pkey)
+        self.drop = eqx.nn.Dropout(config.dropout)
+        self.h = [Block(config, hkey) for _ in range(config.n_layer)]
+        self.ln_f = eqx.nn.LayerNorm(config.n_embd, use_bias=config.bias)
+
+    def __call__(self, idx):
+        t, = idx.shape
+        assert t <= self._config.block_size, f"Cannot forward sequence of length {t}, block size is only {self._config.block_size}"
+        pos = jnp.arange(0, t, dtype=jnp.int64)
+
+        tok_emb = jax.vmap(self.wte)(idx)  # token embeddings of shape (t, n_embd)
+        pos_emb = jax.vmap(self.wpe)(pos)  # position embeddings of shape (t, n_embd)
+        x = self.drop(tok_emb + pos_emb)
+        for block in self.h:
+            x = block(x)
+        x = jax.vmap(self.ln_f)(x)
+        
+        return x
+
+class GPT(eqx.Module):
+    _config: GPTConfig = eqx.field(static=True)
+
+    transformer: TransformerLayer
+
+    lm_head: eqx.nn.Linear
+
+    def __init__(self, config, key):        
+        tkey, lmhkey = jax.random.split(key, 2)
+
+        assert config.vocab_size is not None
+        assert config.block_size is not None
+        self._config = config
+
+        self.transformer = TransformerLayer(config, tkey)
         
         self.lm_head = eqx.nn.Linear(config.n_embd, config.vocab_size, use_bias=False, key=lmhkey)
-
-
-        # for path, p in jax.tree_util.tree_flatten_with_path(self, is_leaf=lambda x: isinstance(x, eqx.nn.Linear))[0]:
-        #     pn = ''
-
-        #     for index in range(len(path)):
-        #         if isinstance(path[index], jax._src.tree_util.DictKey):
-        #             pn += '.' + path[index].key
-        #         else:
-        #             pn += str(path[index])
-            
-        #     if isinstance(p, eqx.nn.Linear):
-        #         print(type(p))
-        
-        # for x in jax.tree_util.tree_leaves(self):
-        #     print(dir(x))
-
-        # for x in jax.tree_util.tree_flatten_with_path(self, is_leaf=lambda x: isinstance(x, eqx.nn.Linear)):
-        #     if isinstance(x, eqx.nn.Linear):
-        #         print(x)
     
         # report number of parameters
         print("number of parameters: %.2fM" % (self.get_num_params() / 1e6,))
@@ -212,9 +217,9 @@ class GPT(eqx.Module):
         The token embeddings would too, except due to the parameter sharing these
         params are actually used as weights in the final layer, so we include them.
         """
-        n_params = sum(jnp.prod(jnp.array(list(p.shape))) for p in jax.tree_util.tree_leaves(self) if type(p) != float and type(p) != bool)
+        n_params = sum(x.size for x in jax.tree_util.tree_leaves(eqx.filter(self, eqx.is_array)))
         if non_embedding:
-            n_params -= jnp.prod(jnp.array(list(self.att_wpe.weight.shape)))
+            n_params -= sum(self.transformer.wpe.weight.shape)
         return n_params
     
     @staticmethod
@@ -258,8 +263,8 @@ class GPT(eqx.Module):
 
             return init_layer(model, is_embedding, mean=0.0, std=0.2)
         
-        def init_att_wte_weights(model):
-            get_att_wte_weights = lambda m : GPT.find_sub_tree(m, "att_wte.weight")
+        def init_transformer_wte_weights(model):
+            get_att_wte_weights = lambda m : GPT.find_sub_tree(m, "transformer.wte.weight")
             get_lm_head_weights = lambda m : GPT.find_sub_tree(m, "lm_head.weight")
 
             lm_head_weights = get_lm_head_weights(model)
@@ -278,7 +283,7 @@ class GPT(eqx.Module):
         initialized_model = init_linear(model)
         initialized_model = init_embedding(initialized_model)
         # Update the att_wte weights
-        initialized_model = init_att_wte_weights(initialized_model)
+        initialized_model = init_transformer_wte_weights(initialized_model)
         # apply special scaled init to the residual projections, per GPT-2 paper
         initialized_model = init_c_proj_weights_with_normal(initialized_model)
 
@@ -304,40 +309,32 @@ class GPT(eqx.Module):
         
         return out
 
-    def __call__(self, idx, targets=None):
-        b, t = idx.shape # TODO Check what idx is sent
-        assert t <= self._config.block_size, f"Cannot forward sequence of length {t}, block size is only {self._config.block_size}"
-        pos = jnp.expand_dims(jnp.arange(0, t, dtype=jnp.int64), 0) # shape (1, t)
 
-        # forward the GPT model itself
-        tok_emb = self.att_wte(idx)  # token embeddings of shape (b, t, n_embd)
-        pos_emb = self.att_wpe(pos)  # position embeddings of shape (1, t, n_embd)
-        x = self.att_drop(tok_emb + pos_emb)
-        for block in self.att_h:
-            x = block(x)
-        x = self.att_ln_f(x)
+    def __call__(self, idx, targets=None):
+        x = self.transformer(idx)
 
         if targets is not None:
             # if we are given some desired targets also calculate the loss
-            logits = self.lm_head(x)
+            logits = jax.vmap(self.lm_head)(x)
             loss = optax.softmax_cross_entropy(logits.reshape((-1, logits.shape[-1])), targets.reshape(-1))
         else:
             # inference-time mini-optimization: only forward the lm_head on the very last position
-            logits = self.lm_head(x[:, [-1], :])  # note: using list [-1] to preserve the time dim
+            logits = jax.vmap(self.lm_head)(x[[-1], :])  # note: using list [-1] to preserve the time dim
             loss = None
 
         return logits, loss
 
-    def crop_block_size(self, block_size):
-        # model surgery to decrease the block size if necessary
-        # e.g. we may load the GPT2 pretrained model checkpoint (block size 1024)
-        # but want to use a smaller block size for some smaller, simpler model
-        assert block_size <= self._config.block_size
-        self._config.block_size = block_size
-        self.att_wpe.weight = self.att_wpe.weight[:block_size]
-        for block in self.att_h:
-            if hasattr(block.attn, 'bias'):
-                block.attn.bias = block.attn.bias[:, :, :block_size, :block_size]
+    ### Needs to be refined and fixed if one requires to change the block size of the GPT model
+    # def crop_block_size(self, block_size):
+    #     # model surgery to decrease the block size if necessary
+    #     # e.g. we may load the GPT2 pretrained model checkpoint (block size 1024)
+    #     # but want to use a smaller block size for some smaller, simpler model
+    #     assert block_size <= self._config.block_size
+    #     self._config.block_size = block_size
+    #     self.att_wpe.weight = self.att_wpe.weight[:block_size]
+    #     for block in self.att_h:
+    #         if hasattr(block.attn, 'bias'):
+    #             block.attn.bias = block.attn.bias[:, :, :block_size, :block_size]
 
     # @classmethod
     # def from_pretrained(cls, model_type, key, override_args=None):
@@ -397,70 +394,31 @@ class GPT(eqx.Module):
 
     #     return model
 
-    def configure_optimizers(self, weight_decay, learning_rate, betas, device_type):
+    def configure_optimizers(self, weight_decay, learning_rate, betas):
         """
         This long function is unfortunately doing something very simple and is being very defensive:
         We are separating out all parameters of the model into two buckets: those that will experience
         weight decay for regularization and those that won't (biases, and layernorm/embedding weights).
         We are then returning the PyTorch optimizer object.
         """
+        b1, b2 = betas
 
         # separate out all parameters to those that will and won't experience regularizing weight decay
-        whitelist_weight_modules = (eqx.nn.Linear,)
-        blacklist_weight_modules = (eqx.nn.LayerNorm, eqx.nn.LayerNorm, eqx.nn.Embedding)
-        decay = set(GPT.find_sub_tree(self, "weight", filter_fn=lambda x: any(isinstance(x, w) for w in whitelist_weight_modules)))
-        no_decay = set(
-            GPT.find_sub_tree(self, "bias").extend(
-                GPT.find_sub_tree(self, "weight", filter_fn=lambda x: any(isinstance(x, b) for b in blacklist_weight_modules))
-            )
-        )
+        param_dict = {pn: p for pn, p in eqx_helper.named_parameters(self)}
+        # create optim groups. Any parameters that is 2D will be weight decayed, otherwise no.
+        # i.e. all weight tensors in matmuls + embeddings decay, all biases and layernorms don't.
+        decay_params = [p for n, p in param_dict.items() if p.ndim >= 2]
+        decay_param_tree = eqx.filter(self, lambda l: any([jnp.array_equal(l, x) for x in decay_params]), replace=False)
+        decay_param_tree = eqx.filter(decay_param_tree, lambda l: l is False, replace=True)
+        nodecay_params = [p for n, p in param_dict.items() if p.ndim < 2]
 
-        
-        # for mn, m in self.named_modules():
-        #     for pn, p in m.named_parameters():
-        #         fpn = '%s.%s' % (mn, pn) if mn else pn  # full param name
-        #         # random note: because named_modules and named_parameters are recursive
-        #         # we will see the same tensors p many many times. but doing it this way
-        #         # allows us to know which parent module any tensor p belongs to...
-        #         if pn.endswith('bias'):
-        #             # all biases will not be decayed
-        #             no_decay.add(fpn)
-        #         elif pn.endswith('weight') and isinstance(m, whitelist_weight_modules):
-        #             # weights of whitelist modules will be weight decayed
-        #             decay.add(fpn)
-        #         elif pn.endswith('weight') and isinstance(m, blacklist_weight_modules):
-        #             # weights of blacklist modules will NOT be weight decayed
-        #             no_decay.add(fpn)
-        
+        num_decay_params = sum(jax.numpy.size(p) for p in decay_params)
+        num_nodecay_params = sum(jax.numpy.size(p) for p in nodecay_params)
+        print(f"num decayed parameter tensors: {len(decay_params)}, with {num_decay_params:,} parameters")
+        print(f"num non-decayed parameter tensors: {len(nodecay_params)}, with {num_nodecay_params:,} parameters")
+        # Create AdamW optimizer and use the fused version if it is available
 
-
-        # subtle: 'transformer.wte.weight' and 'lm_head.weight' are tied, so they
-        # will appear in the no_decay and decay sets respectively after the above.
-        # In addition, because named_parameters() doesn't return duplicates, it
-        # will only return the first occurence, key'd by 'transformer.wte.weight', below.
-        # so let's manually remove 'lm_head.weight' from decay set. This will include
-        # this tensor into optimization via transformer.wte.weight only, and not decayed.
-        decay.remove('lm_head.weight')
-
-        # validate that we considered every parameter
-        param_dict = {pn: p for pn, p in self.named_parameters()}
-        inter_params = decay & no_decay
-        union_params = decay | no_decay
-        assert len(inter_params) == 0, "parameters %s made it into both decay/no_decay sets!" % (str(inter_params),)
-        assert len(
-            param_dict.keys() - union_params) == 0, "parameters %s were not separated into either decay/no_decay set!" \
-                                                    % (str(param_dict.keys() - union_params),)
-
-        # create the pytorch optimizer object
-        optim_groups = [
-            {"params": [param_dict[pn] for pn in sorted(list(decay))], "weight_decay": weight_decay},
-            {"params": [param_dict[pn] for pn in sorted(list(no_decay))], "weight_decay": 0.0},
-        ]
-        # new PyTorch nightly has a new 'fused' option for AdamW that is much faster
-        use_fused = (device_type == 'cuda') and ('fused' in inspect.signature(torch.optim.AdamW).parameters)
-        print(f"using fused AdamW: {use_fused}")
-        extra_args = dict(fused=True) if use_fused else dict()
-        optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=betas, **extra_args)
+        optimizer = optax.adamw(learning_rate=learning_rate, b1=b1, b2=b2, weight_decay=weight_decay, mask=decay_param_tree)
 
         return optimizer
 
@@ -489,18 +447,18 @@ class GPT(eqx.Module):
 
         for _ in range(max_new_tokens):
             # if the sequence context is growing too long we must crop it at block_size
-            idx_cond = idx if idx.shape[1] <= self._config.block_size else idx[:, -self._config.block_size:]
+            idx_cond = idx if idx.shape[0] <= self._config.block_size else idx[-self._config.block_size:]
             # forward the model to get the logits for the index in the sequence
             logits, _ = self(idx_cond)
             # pluck the logits at the final step and scale by desired temperature
-            logits = logits[:, -1, :] / temperature
+            logits = logits[-1, :] / temperature
             # optionally crop the logits to only the top k options
             if top_k is not None:
                 v, _ = lax.top_k(logits, min(top_k, logits.shape[-1]))
-                logits[logits < v[:, [-1]]] = -float('Inf')
+                logits = logits.at[logits < v[:, [-1]]].set(-float('Inf'))
             # sample from the distribution
             idx_next = jax.random.categorical(jax.random.PRNGKey(0), logits, shape=(1, ))
             # append sampled index to the running sequence and continue
-            idx = jnp.concatenate((idx, idx_next), axis=1)
+            idx = jnp.concatenate((idx, idx_next), axis=0)
 
         return idx
