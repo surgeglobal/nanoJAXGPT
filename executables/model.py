@@ -34,19 +34,15 @@ class SwiGLU(eqx.Module):
 
     W: jax.Array
     V: jax.Array
-    b: jax.Array
-    c: jax.Array
 
     def __init__(self, dim_in, dim_out, key):
-        k1, k2, k3, k4 = jax.random.split(key, 4)
-        
+        k1, k2 = jax.random.split(key, 2)
+
         self.W = jax.random.normal(k1, (dim_in, dim_out))
         self.V = jax.random.normal(k2, (dim_in, dim_out))
-        self.b = jax.random.normal(k3, (dim_out,))
-        self.c = jax.random.normal(k4, (dim_out,))
 
     def __call__(self, x):
-        return jax.nn.swish(jnp.dot(x, self.W) + self.b) * (jnp.dot(x, self.V) + self.c)
+        return jax.nn.swish(jnp.dot(x, self.W)) * (jnp.dot(x, self.V))
 
 @dataclass
 class GPTConfig:
@@ -64,7 +60,7 @@ class CausalSelfAttention(eqx.Module):
     attn_dropout: eqx.nn.Dropout
     resid_dropout: eqx.nn.Dropout
     bias: jax.Array = eqx.field(static=True)
-    
+
     _config: GPTConfig = eqx.field(static=True)
 
     def __init__(self, config, key):
@@ -137,7 +133,7 @@ class MLP(eqx.Module):
 class Block(eqx.Module):
     ln_1: eqx.nn.LayerNorm
     attn: CausalSelfAttention
-    ln_2: eqx.nn.LayerNorm    
+    ln_2: eqx.nn.LayerNorm
     mlp: MLP
 
     def __init__(self, config, key):
@@ -186,14 +182,13 @@ class TransformerLayer(eqx.Module):
         for block in self.h:
             x = block(x)
         x = jax.vmap(self.ln_f)(x)
-        
+
         return x
 
 class GPT(eqx.Module):
     _config: GPTConfig = eqx.field(static=True)
 
     transformer: TransformerLayer
-
     lm_head: eqx.nn.Linear
 
     def __init__(self, config, key):        
@@ -310,19 +305,16 @@ class GPT(eqx.Module):
         return out
 
 
-    def __call__(self, idx, targets=None):
+    def __call__(self, idx, train_mode=False):
         x = self.transformer(idx)
 
-        if targets is not None:
-            # if we are given some desired targets also calculate the loss
+        if train_mode:
             logits = jax.vmap(self.lm_head)(x)
-            loss = optax.softmax_cross_entropy(logits.reshape((-1, logits.shape[-1])), targets.reshape(-1))
         else:
             # inference-time mini-optimization: only forward the lm_head on the very last position
             logits = jax.vmap(self.lm_head)(x[[-1], :])  # note: using list [-1] to preserve the time dim
-            loss = None
 
-        return logits, loss
+        return logits
 
     ### Needs to be refined and fixed if one requires to change the block size of the GPT model
     # def crop_block_size(self, block_size):

@@ -20,18 +20,23 @@ import os
 import time
 import math
 import pickle
-from contextlib import nullcontext
+import random
+import modal
 
 import jax
 import jax.numpy as jnp
 import numpy as np
-import torch
-from torch.nn.parallel import DistributedDataParallel as DDP
-from torch.distributed import init_process_group, destroy_process_group
+import optax
+import equinox as eqx
+
+from tqdm import tqdm
 
 from model import GPTConfig, GPT
 
 from dotenv import load_dotenv
+
+
+# jax.config.update("jax_enable_x64", True)
 
 # -----------------------------------------------------------------------------
 # loading .env config
@@ -44,7 +49,7 @@ load_dotenv()
 out_dir = 'out'
 eval_interval = 2000
 log_interval = 1
-eval_iters = 200
+eval_iters = 10
 eval_only = False  # if True, script exits right after the first eval
 always_save_checkpoint = True  # if True, always save a checkpoint after each eval
 init_from = 'scratch'  # 'scratch' or 'resume' or 'gpt2*'
@@ -53,9 +58,8 @@ wandb_log = False  # disabled by default
 wandb_project = 'owt'
 wandb_run_name = 'gpt2'  # 'run' + str(time.time())
 # data
-dataset = 'openwebtext'
-gradient_accumulation_steps = 5 * 8  # used to simulate larger batch sizes
-batch_size = 12  # if gradient_accumulation_steps > 1, this is the micro-batch size
+dataset = 'shakespeare'
+batch_size = 12
 block_size = 1024 ### If block size is different to 1024, changes need to be made in GPT.crop_block_size() method
 # model
 n_layer = 12
@@ -87,50 +91,38 @@ exec(open('configurator.py').read())  # overrides from command line or config fi
 config = {k: globals()[k] for k in config_keys}  # will be useful for logging
 # -----------------------------------------------------------------------------
 
-# various inits, derived attributes, I/O setup
-ddp = int(os.environ.get('RANK', -1)) != -1  # is this a ddp run?
-if ddp:
-    init_process_group(backend=backend)
-    ddp_rank = int(os.environ['RANK'])
-    ddp_local_rank = int(os.environ['LOCAL_RANK'])
-    ddp_world_size = int(os.environ['WORLD_SIZE'])
-    device = f'cuda:{ddp_local_rank}'
-    torch.cuda.set_device(device)
-    master_process = ddp_rank == 0  # this process will do logging, checkpointing etc.
-    seed_offset = ddp_rank  # each process gets a different seed
-    assert gradient_accumulation_steps % torch.cuda.device_count() == 0
-    gradient_accumulation_steps //= torch.cuda.device_count()
-else:
-    # if not ddp, we are running on a single gpu, and one process
-    master_process = True
-    seed_offset = 0
-    ddp_world_size = 1
-tokens_per_iter = gradient_accumulation_steps * ddp_world_size * batch_size * block_size
+# DDP has not been implemented in this train script. We are open for contributions.
+random_seed = 1337
+seed_offset = 0
+
+tokens_per_iter = batch_size * block_size
 print(f"tokens per iteration will be: {tokens_per_iter:,}")
 
-if master_process:
-    os.makedirs(out_dir, exist_ok=True)
-torch.manual_seed(1337 + seed_offset)
-torch.backends.cuda.matmul.allow_tf32 = True  # allow tf32 on matmul
-torch.backends.cudnn.allow_tf32 = True  # allow tf32 on cudnn
-device_type = 'cuda' if 'cuda' in device else 'cpu'  # for later use in torch.autocast
+os.makedirs(out_dir, exist_ok=True)
+key = jax.random.PRNGKey(1337 + seed_offset)
+jax.default_matmul_precision = 'tensorfloat32'
+
+gb_key, gpt_key = jax.random.split(key)
+
 # note: float16 data type will automatically use a GradScaler
-ptdtype = {'float32': torch.float32, 'bfloat16': torch.bfloat16, 'float16': torch.float16}[dtype]
-ctx = nullcontext() if device_type == 'cpu' else torch.amp.autocast(device_type=device_type, dtype=ptdtype)
+ptdtype = {'float32': jnp.float32, 'bfloat16': jnp.bfloat16, 'float16': jnp.float16}[dtype]
 
 # poor man's data loader
 data_dir = os.path.join('data', dataset)
-train_data = np.memmap(os.path.join(data_dir, 'train.bin'), dtype=np.uint16, mode='r')
-val_data = np.memmap(os.path.join(data_dir, 'val.bin'), dtype=np.uint16, mode='r')
 
+def get_batch(split: str, key: jax.random.PRNGKey):
+    # We recreate np.memmap every batch to avoid a memory leak, as per
+    # https://stackoverflow.com/questions/45132940/numpy-memmap-memory-usage-want-to-iterate-once/61472122#61472122
+    if split == 'train':
+        data = np.memmap(os.path.join(data_dir, 'train.bin'), dtype=np.uint16, mode='r')
+    else:
+        data = np.memmap(os.path.join(data_dir, 'val.bin'), dtype=np.uint16, mode='r')
 
-def get_batch(split, key: jax.random.PRNGKey = None):
-    data = train_data if split == 'train' else val_data
 
     ix = jax.random.randint(key, (batch_size,), 0, len(data) - block_size)
     x = jnp.stack([jnp.array(data[i:i+block_size], dtype=jnp.int64) for i in ix])
     y = jnp.stack([jnp.array(data[i+1:i+1+block_size], dtype=jnp.int64) for i in ix])
-    
+
     return x, y
 
 
@@ -148,8 +140,16 @@ if os.path.exists(meta_path):
     print(f"found vocab_size = {meta_vocab_size} (inside {meta_path})")
 
 # model init
-model_args = dict(n_layer=n_layer, n_head=n_head, n_embd=n_embd, block_size=block_size,
-                  bias=bias, vocab_size=None, dropout=dropout)  # start with model_args from command line
+model_args = dict(
+    n_layer=n_layer,
+    n_head=n_head,
+    n_embd=n_embd,
+    block_size=block_size,
+    bias=bias,
+    vocab_size=None,
+    dropout=dropout
+)  # start with model_args from command line
+
 if init_from == 'scratch':
     # init a new model from scratch
     print("Initializing a new model from scratch")
@@ -158,7 +158,7 @@ if init_from == 'scratch':
         print("defaulting to vocab_size of GPT-2 to 50304 (50257 rounded up for efficiency)")
     model_args['vocab_size'] = meta_vocab_size if meta_vocab_size is not None else 50304
     gptconf = GPTConfig(**model_args)
-    model = GPT(gptconf)
+    model = GPT(gptconf, gpt_key)
 elif init_from == 'resume':
     print(f"Resuming training from {out_dir}")
     # resume training from a checkpoint.
@@ -190,49 +190,14 @@ elif init_from.startswith('gpt2'):
     # read off the created config params, so we can store them into checkpoint correctly
     for k in ['n_layer', 'n_head', 'n_embd', 'block_size', 'bias', 'vocab_size']:
         model_args[k] = getattr(model.config, k)
-# crop down the model block size if desired, using model surgery
-if block_size < model.config.block_size:
-    model.crop_block_size(block_size)
-    model_args['block_size'] = block_size  # so that the checkpoint will have the right value
-model.to(device)
 
-# initialize a GradScaler. If enabled=False scaler is a no-op
-scaler = torch.cuda.amp.GradScaler(enabled=(dtype == 'float16'))
+# # crop down the model block size if desired, using model surgery ## NOT IMPLEMENTED YET
+# if block_size < model.config.block_size:
+#     model.crop_block_size(block_size)
+#     model_args['block_size'] = block_size  # so that the checkpoint will have the right value
+
 
 # optimizer
-optimizer = model.configure_optimizers(weight_decay, learning_rate, (beta1, beta2), device_type)
-if init_from == 'resume':
-    optimizer.load_state_dict(checkpoint['optimizer'])
-checkpoint = None  # free up memory
-
-# compile the model
-if compile:
-    print("compiling the model... (takes a ~minute)")
-    unoptimized_model = model
-    model = torch.compile(model)  # requires PyTorch 2.0
-
-# wrap model into DDP container
-if ddp:
-    model = DDP(model, device_ids=[ddp_local_rank])
-
-
-# helps estimate an arbitrarily accurate loss over either split using many batches
-@torch.no_grad()
-def estimate_loss():
-    out = {}
-    model.eval()
-    for split in ['train', 'val']:
-        losses = torch.zeros(eval_iters)
-        for k in range(eval_iters):
-            X, Y = get_batch(split)
-            with ctx:
-                logits, loss = model(X, Y)
-            losses[k] = loss.item()
-        out[split] = losses.mean()
-    model.train()
-    return out
-
-
 # learning rate decay scheduler (cosine with warmup)
 def get_lr(it):
     # 1) linear warmup for warmup_iters steps
@@ -247,28 +212,87 @@ def get_lr(it):
     coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio))  # coeff ranges 0..1
     return min_lr + coeff * (learning_rate - min_lr)
 
+lr_scheduler = lambda iter_num: get_lr(iter_num) if decay_lr else learning_rate
+optimizer = optax.adamw(learning_rate=lr_scheduler)
+if init_from == 'resume':
+    optimizer.load_state_dict(checkpoint['optimizer'])
+checkpoint = None  # free up memory
+
+
+@eqx.filter_jit
+def compute_loss(model, x, y):
+    logits = jax.vmap(model, in_axes=(0, None))(x, True)
+    print(logits.shape)
+
+    return jnp.mean(
+        optax.softmax_cross_entropy_with_integer_labels(
+            logits=logits.reshape(-1, logits.shape[-1]),
+            labels=y.reshape(-1)
+        )
+    )
+
+def evaluate(model):
+    losses = jnp.zeros(eval_iters)
+
+    for k in range(eval_iters):
+        val_key = jax.random.PRNGKey(k + 12)
+
+        x, y = get_batch("val", val_key)
+
+        loss = compute_loss(model, jax.lax.stop_gradient(x), y)
+        losses = losses.at[k].set(loss)
+
+    return jnp.mean(losses)
 
 # logging
-if wandb_log and master_process:
+if wandb_log:
     import wandb
 
     wandb.init(project=wandb_project, name=wandb_run_name, config=config)
+
+def train(
+    model,
+    optimizer,
+    max_iters,
+    eval_interval
+):
+    from model import GPT
+    # Initialize optimizer state with filtered model
+    optimizer_state = optimizer.init(eqx.filter(model, eqx.is_array))
+
+    def make_step(
+        model,
+        optimizer_state,
+        x,
+        y
+    ):
+        loss, grads = eqx.filter_value_and_grad(compute_loss)(model, x, y)
+        updates, optimizer_state = optimizer.update(grads, optimizer_state, model)
+        model = eqx.apply_updates(model, updates)
+        return model, optimizer_state, loss
+
+    for iter_num in tqdm(range(max_iters), desc="steps"):
+        train_key = jax.random.PRNGKey(iter_num + 56)
+        x, y = get_batch("train", train_key)
+
+        model, optimizer_state, train_loss = make_step(model, optimizer_state, x, y)
+        if (iter_num % eval_interval) == 0 or (iter_num == max_iters - 1):
+            val_loss = evaluate(model)
+            print(f"iter_num {iter_num}: train loss {train_loss:.4f}, val loss {val_loss:.4f}")
+
+
+model = train(model, optimizer, max_iters, eval_interval)
+exit()
 
 # training loop
 X, Y = get_batch('train')  # fetch the very first batch
 t0 = time.time()
 local_iter_num = 0  # number of iterations in the lifetime of this process
-raw_model = model.module if ddp else model  # unwrap DDP container if needed
+raw_model = model
 running_mfu = -1.0
 while True:
-
-    # determine and set the learning rate for this iteration
-    lr = get_lr(iter_num) if decay_lr else learning_rate
-    for param_group in optimizer.param_groups:
-        param_group['lr'] = lr
-
     # evaluate the loss on train/val sets and write checkpoints
-    if iter_num % eval_interval == 0 and master_process:
+    if iter_num % eval_interval == 0:
         losses = estimate_loss()
         print(f"step {iter_num}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
         if wandb_log:
@@ -325,7 +349,7 @@ while True:
     t1 = time.time()
     dt = t1 - t0
     t0 = t1
-    if iter_num % log_interval == 0 and master_process:
+    if iter_num % log_interval == 0:
         # get loss as float. note: this is a CPU-GPU sync point
         # scale up to undo the division above, approximating the true total loss (exact would have been a sum)
         lossf = loss.item() * gradient_accumulation_steps
@@ -339,6 +363,3 @@ while True:
     # termination conditions
     if iter_num > max_iters:
         break
-
-if ddp:
-    destroy_process_group()
