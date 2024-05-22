@@ -29,14 +29,11 @@ import numpy as np
 import optax
 import equinox as eqx
 
-from tqdm import tqdm
-
-from model import GPTConfig, GPT
+from executables.model import GPTConfig, GPT
 
 from dotenv import load_dotenv
 
-
-# jax.config.update("jax_enable_x64", True)
+jax.config.update("jax_enable_x64", True)
 
 # -----------------------------------------------------------------------------
 # loading .env config
@@ -46,12 +43,13 @@ load_dotenv()
 # -----------------------------------------------------------------------------
 # default config values designed to train a gpt2 (124M) on OpenWebText
 # I/O
-out_dir = 'out'
-eval_interval = 2000
+timestamp = time.time()
+out_dir = f'/bucket/gpt2/{timestamp}'
+eval_interval = 100
 log_interval = 1
 eval_iters = 10
 eval_only = False  # if True, script exits right after the first eval
-always_save_checkpoint = True  # if True, always save a checkpoint after each eval
+always_save_checkpoint = False  # if True, always save a checkpoint after each eval
 init_from = 'scratch'  # 'scratch' or 'resume' or 'gpt2*'
 # wandb logging
 wandb_log = False  # disabled by default
@@ -59,8 +57,8 @@ wandb_project = 'owt'
 wandb_run_name = 'gpt2'  # 'run' + str(time.time())
 # data
 dataset = 'shakespeare'
-batch_size = 12
-block_size = 1024 ### If block size is different to 1024, changes need to be made in GPT.crop_block_size() method
+batch_size = 8
+block_size = 1024  ### If block size is different to 1024, changes need to be made in GPT.crop_block_size() method
 # model
 n_layer = 12
 n_head = 12
@@ -79,15 +77,13 @@ decay_lr = True  # whether to decay the learning rate
 warmup_iters = 2000  # how many steps to warm up for
 lr_decay_iters = 600000  # should be ~= max_iters per Chinchilla
 min_lr = 6e-5  # minimum learning rate, should be ~= learning_rate/10 per Chinchilla
-# DDP settings
-backend = 'nccl'  # 'nccl', 'gloo', etc.
+
 # system
-device = os.getenv("NANO_JAX_GPT_DEVICE")  # examples: 'cpu', 'cuda', 'cuda:0', 'cuda:1' etc., or try 'mps' on macbooks
-dtype = 'bfloat16'  # 'float32', 'bfloat16', or 'float16', the latter will auto implement a GradScaler
-compile = os.getenv("NANO_JAX_GPT_COMPILE") == 1  # use PyTorch 2.0 to compile the model to be faster
+# dtype = 'bfloat16' if jax.default_backend() != 'cpu' else 'float16'  # 'float32', 'bfloat16', or 'float16', the latter will auto implement a GradScaler
+dtype = 'float32'
 # -----------------------------------------------------------------------------
 config_keys = [k for k, v in globals().items() if not k.startswith('_') and isinstance(v, (int, float, bool, str))]
-exec(open('configurator.py').read())  # overrides from command line or config file
+# exec(open('executables/configurator.py').read())  # overrides from command line or config file
 config = {k: globals()[k] for k in config_keys}  # will be useful for logging
 # -----------------------------------------------------------------------------
 
@@ -99,18 +95,16 @@ tokens_per_iter = batch_size * block_size
 print(f"tokens per iteration will be: {tokens_per_iter:,}")
 
 os.makedirs(out_dir, exist_ok=True)
-key = jax.random.PRNGKey(1337 + seed_offset)
-jax.default_matmul_precision = 'tensorfloat32'
 
-gb_key, gpt_key = jax.random.split(key)
-
-# note: float16 data type will automatically use a GradScaler
-ptdtype = {'float32': jnp.float32, 'bfloat16': jnp.bfloat16, 'float16': jnp.float16}[dtype]
+np.random.seed(random_seed + seed_offset)
+key = jax.random.PRNGKey(random_seed + seed_offset)
+train_key, gpt_key = jax.random.split(key)
 
 # poor man's data loader
 data_dir = os.path.join('data', dataset)
 
-def get_batch(split: str, key: jax.random.PRNGKey):
+
+def get_batch(split: str):
     # We recreate np.memmap every batch to avoid a memory leak, as per
     # https://stackoverflow.com/questions/45132940/numpy-memmap-memory-usage-want-to-iterate-once/61472122#61472122
     if split == 'train':
@@ -118,10 +112,9 @@ def get_batch(split: str, key: jax.random.PRNGKey):
     else:
         data = np.memmap(os.path.join(data_dir, 'val.bin'), dtype=np.uint16, mode='r')
 
-
-    ix = jax.random.randint(key, (batch_size,), 0, len(data) - block_size)
-    x = jnp.stack([jnp.array(data[i:i+block_size], dtype=jnp.int64) for i in ix])
-    y = jnp.stack([jnp.array(data[i+1:i+1+block_size], dtype=jnp.int64) for i in ix])
+    ix = np.random.randint(len(data) - block_size, size=(batch_size,))
+    x = jnp.stack([jnp.array(data[i:i + block_size], dtype=jnp.int64) for i in ix])
+    y = jnp.stack([jnp.array(data[i + 1:i + 1 + block_size], dtype=jnp.int64) for i in ix])
 
     return x, y
 
@@ -150,16 +143,7 @@ model_args = dict(
     dropout=dropout
 )  # start with model_args from command line
 
-if init_from == 'scratch':
-    # init a new model from scratch
-    print("Initializing a new model from scratch")
-    # determine the vocab size we'll use for from-scratch training
-    if meta_vocab_size is None:
-        print("defaulting to vocab_size of GPT-2 to 50304 (50257 rounded up for efficiency)")
-    model_args['vocab_size'] = meta_vocab_size if meta_vocab_size is not None else 50304
-    gptconf = GPTConfig(**model_args)
-    model = GPT(gptconf, gpt_key)
-elif init_from == 'resume':
+if init_from == 'resume':
     print(f"Resuming training from {out_dir}")
     # resume training from a checkpoint.
     ckpt_path = os.path.join(out_dir, 'ckpt.pt')
@@ -190,6 +174,33 @@ elif init_from.startswith('gpt2'):
     # read off the created config params, so we can store them into checkpoint correctly
     for k in ['n_layer', 'n_head', 'n_embd', 'block_size', 'bias', 'vocab_size']:
         model_args[k] = getattr(model.config, k)
+else:
+    # init a new model from scratch
+    print("Initializing a new model from scratch")
+    # determine the vocab size we'll use for from-scratch training
+    if meta_vocab_size is None:
+        print("defaulting to vocab_size of GPT-2 to 50304 (50257 rounded up for efficiency)")
+    model_args['vocab_size'] = meta_vocab_size if meta_vocab_size is not None else 50304
+    gptconf = GPTConfig(**model_args)
+    model = GPT(gptconf, gpt_key)
+
+
+def convert_pytree_to_dtype(pytree, dtype):
+    def _convert(leaf):
+        if eqx.is_array(leaf):
+            return leaf.astype(dtype)
+        else:
+            return leaf
+
+    return jax.tree_util.tree_map(_convert, pytree)
+
+
+if dtype == 'bfloat16':
+    model = convert_pytree_to_dtype(model, jnp.bfloat16)
+elif dtype == 'float16':
+    model = convert_pytree_to_dtype(model, jnp.float16)
+elif dtype == 'float32':
+    model = convert_pytree_to_dtype(model, jnp.float32)
 
 # # crop down the model block size if desired, using model surgery ## NOT IMPLEMENTED YET
 # if block_size < model.config.block_size:
@@ -199,167 +210,119 @@ elif init_from.startswith('gpt2'):
 
 # optimizer
 # learning rate decay scheduler (cosine with warmup)
-def get_lr(it):
-    # 1) linear warmup for warmup_iters steps
-    if it < warmup_iters:
-        return learning_rate * it / warmup_iters
-    # 2) if it > lr_decay_iters, return min learning rate
-    if it > lr_decay_iters:
-        return min_lr
-    # 3) in between, use cosine decay down to min learning rate
-    decay_ratio = (it - warmup_iters) / (lr_decay_iters - warmup_iters)
-    assert 0 <= decay_ratio <= 1
-    coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio))  # coeff ranges 0..1
-    return min_lr + coeff * (learning_rate - min_lr)
-
-lr_scheduler = lambda iter_num: get_lr(iter_num) if decay_lr else learning_rate
-optimizer = optax.adamw(learning_rate=lr_scheduler)
+lr_scheduler = optax.warmup_cosine_decay_schedule(
+    init_value=0.0,
+    peak_value=learning_rate,
+    warmup_steps=warmup_iters,
+    decay_steps=lr_decay_iters,
+    end_value=min_lr,
+)
+optimizer = optax.inject_hyperparams(optax.adamw)(learning_rate=lr_scheduler)
 if init_from == 'resume':
     optimizer.load_state_dict(checkpoint['optimizer'])
 checkpoint = None  # free up memory
 
 
-@eqx.filter_jit
 def compute_loss(model, x, y):
     logits = jax.vmap(model, in_axes=(0, None))(x, True)
-    print(logits.shape)
 
-    return jnp.mean(
-        optax.softmax_cross_entropy_with_integer_labels(
-            logits=logits.reshape(-1, logits.shape[-1]),
-            labels=y.reshape(-1)
-        )
+    loss = optax.softmax_cross_entropy_with_integer_labels(
+        logits=logits, # B, T, C
+        labels=y, # B, T
     )
 
-def evaluate(model):
-    losses = jnp.zeros(eval_iters)
+    return jnp.mean(loss)
 
-    for k in range(eval_iters):
-        val_key = jax.random.PRNGKey(k + 12)
 
-        x, y = get_batch("val", val_key)
+def make_step(
+        model,
+        optimizer_state,
+        x,
+        y
+):
+    loss, grads = eqx.filter_value_and_grad(compute_loss)(model, x, y)
+    updates, optimizer_state = optimizer.update(grads, optimizer_state, model) ## TODO: optimzer.update() issue needs to be resolved. updates initialize to NaN even from the step 0 and this effects the other values to become NaN
+    model = eqx.apply_updates(model, updates)
+    # print(model.transformer.h[0].mlp.c_fc.weight, model.transformer.h[0].mlp.c_fc.weight.mean())
+    return model, optimizer_state, loss
 
-        loss = compute_loss(model, jax.lax.stop_gradient(x), y)
-        losses = losses.at[k].set(loss)
 
-    return jnp.mean(losses)
+def estimate_loss(model):
+    out = {}
+    model = eqx.nn.inference_mode(model)
+    for split in ['train', 'val']:
+        losses = jnp.zeros(eval_iters)
+        for k in range(eval_iters):
+            x, y = get_batch(split)
+            loss = compute_loss(model, jax.lax.stop_gradient(x), y)
+            losses = losses.at[k].set(loss.item())
+        out[split] = jnp.mean(losses)
+    model = eqx.nn.inference_mode(model, value=False)
+    return out
+
 
 # logging
 if wandb_log:
     import wandb
 
-    wandb.init(project=wandb_project, name=wandb_run_name, config=config)
+    wandb.login(key='d35eb3616c9549c90972c0d35b1efcc3b6af528f')
+    wandb.init(project=wandb_project, name=f"{wandb_run_name}-{timestamp}", config=config)
 
-def train(
-    model,
-    optimizer,
-    max_iters,
-    eval_interval
-):
-    from model import GPT
+
+def train():
+    global model
+    global best_val_loss
     # Initialize optimizer state with filtered model
     optimizer_state = optimizer.init(eqx.filter(model, eqx.is_array))
 
-    def make_step(
-        model,
-        optimizer_state,
-        x,
-        y
-    ):
-        loss, grads = eqx.filter_value_and_grad(compute_loss)(model, x, y)
-        updates, optimizer_state = optimizer.update(grads, optimizer_state, model)
-        model = eqx.apply_updates(model, updates)
-        return model, optimizer_state, loss
+    t0 = time.time()
+    for iter_num in range(max_iters):
+        x, y = get_batch("train")
 
-    for iter_num in tqdm(range(max_iters), desc="steps"):
-        train_key = jax.random.PRNGKey(iter_num + 56)
-        x, y = get_batch("train", train_key)
-
-        model, optimizer_state, train_loss = make_step(model, optimizer_state, x, y)
+        # evaluate the loss on train/val sets and write checkpoints
         if (iter_num % eval_interval) == 0 or (iter_num == max_iters - 1):
-            val_loss = evaluate(model)
-            print(f"iter_num {iter_num}: train loss {train_loss:.4f}, val loss {val_loss:.4f}")
+            losses = estimate_loss(model)
+            lr = optimizer_state.hyperparams['learning_rate'].item()
 
+            print(f"step {iter_num}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}, lr {lr:.4e}")
 
-model = train(model, optimizer, max_iters, eval_interval)
-exit()
+            if wandb_log:
+                wandb.log({
+                    "iter": iter_num,
+                    "train/loss": losses['train'],
+                    "val/loss": losses['val'],
+                    "lr": lr,
+                })
+            if losses['val'] < best_val_loss or always_save_checkpoint:
+                checkpoint_path = os.path.join(out_dir, f"checkpoint-{iter_num}")
+                os.makedirs(checkpoint_path, exist_ok=True)
+                checkpoint_file = os.path.join(checkpoint_path, 'model.eqx')
+                checkpoint_params_file = os.path.join(checkpoint_path, 'params.pkl')
 
-# training loop
-X, Y = get_batch('train')  # fetch the very first batch
-t0 = time.time()
-local_iter_num = 0  # number of iterations in the lifetime of this process
-raw_model = model
-running_mfu = -1.0
-while True:
-    # evaluate the loss on train/val sets and write checkpoints
-    if iter_num % eval_interval == 0:
-        losses = estimate_loss()
-        print(f"step {iter_num}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
-        if wandb_log:
-            wandb.log({
-                "iter": iter_num,
-                "train/loss": losses['train'],
-                "val/loss": losses['val'],
-                "lr": lr,
-                "mfu": running_mfu * 100,  # convert to percentage
-            })
-        if losses['val'] < best_val_loss or always_save_checkpoint:
-            best_val_loss = losses['val']
-            if iter_num > 0:
-                checkpoint = {
-                    'model': raw_model.state_dict(),
-                    'optimizer': optimizer.state_dict(),
-                    'model_args': model_args,
-                    'iter_num': iter_num,
-                    'best_val_loss': best_val_loss,
-                    'config': config,
-                }
-                print(f"saving checkpoint to {out_dir}")
-                torch.save(checkpoint, os.path.join(out_dir, 'ckpt.pt'))
-    if iter_num == 0 and eval_only:
-        break
+                best_val_loss = losses['val']
+                if iter_num > 0:
+                    checkpoint_params = {
+                        "model_args": model_args,
+                        "iter_num": iter_num,
+                        "val_loss": losses["val"],
+                        "opt_state": optimizer_state,
+                        "config": config,
+                    }
+                    with open(checkpoint_params_file, "wb") as f:
+                        pickle.dump(checkpoint_params, f)
+                    eqx.tree_serialise_leaves(checkpoint_file, model)
+                    print(f"save checkpoint to {out_dir}")
 
-    # forward backward update, with optional gradient accumulation to simulate larger batch size
-    # and using the GradScaler if data type is float16
-    for micro_step in range(gradient_accumulation_steps):
-        if ddp:
-            # in DDP training we only need to sync gradients at the last micro step.
-            # the official way to do this is with model.no_sync() context manager, but
-            # I really dislike that this bloats the code and forces us to repeat code
-            # looking at the source of that context manager, it just toggles this variable
-            model.require_backward_grad_sync = (micro_step == gradient_accumulation_steps - 1)
-        with ctx:
-            logits, loss = model(X, Y)
-            loss = loss / gradient_accumulation_steps  # scale the loss to account for gradient accumulation
-        # immediately async prefetch next batch while model is doing the forward pass on the GPU
-        X, Y = get_batch('train')
-        # backward pass, with gradient scaling if training in fp16
-        scaler.scale(loss).backward()
-    # clip the gradient
-    if grad_clip != 0.0:
-        scaler.unscale_(optimizer)
-        torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
-    # step the optimizer and scaler if training in fp16
-    scaler.step(optimizer)
-    scaler.update()
-    # flush the gradients as soon as we can, no need for this memory anymore
-    optimizer.zero_grad(set_to_none=True)
+        if iter_num == 0 and eval_only:
+            break
 
-    # timing and logging
-    t1 = time.time()
-    dt = t1 - t0
-    t0 = t1
-    if iter_num % log_interval == 0:
-        # get loss as float. note: this is a CPU-GPU sync point
-        # scale up to undo the division above, approximating the true total loss (exact would have been a sum)
-        lossf = loss.item() * gradient_accumulation_steps
-        if local_iter_num >= 5:  # let the training loop settle a bit
-            mfu = raw_model.estimate_mfu(batch_size * gradient_accumulation_steps, dt)
-            running_mfu = mfu if running_mfu == -1.0 else 0.9 * running_mfu + 0.1 * mfu
-        print(f"iter {iter_num}: loss {lossf:.4f}, time {dt * 1000:.2f}ms, mfu {running_mfu * 100:.2f}%")
-    iter_num += 1
-    local_iter_num += 1
+        # do a training step
+        model, optimizer_state, loss = make_step(model, optimizer_state, x, y)
 
-    # termination conditions
-    if iter_num > max_iters:
-        break
+        t1 = time.time()
+        dt = t1 - t0
+        t0 = t1
+        if iter_num % log_interval == 0:
+            print(f"iter {iter_num} \t loss: {loss.item():.4f} \t time {dt*1000:.2f}ms")
+            if wandb_log:
+                wandb.log({"train_iter": iter_num, "train_loss": loss.item()})

@@ -1,6 +1,11 @@
 python-dotenv~=1.0.0
 jax>=0.4.6
 equinox>=0.10.4
-optax~=0.1.5
+optax~=0.2.2
 tqdm~=4.65.0
 transformers~=4.29.2
+numpy~=1.26.4
+tiktoken~=0.7.0
+requests~=2.31.0
+modal~=0.62.173
+wandb~=0.17.0

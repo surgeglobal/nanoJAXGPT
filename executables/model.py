@@ -23,6 +23,7 @@ from helpers import eqx as eqx_helper
 
 from typing import Callable, List
 
+
 class SwiGLU(eqx.Module):
     """
     Implementation of the SwiGLU activation function in the paper by Noam Shazeer at Google
@@ -34,15 +35,19 @@ class SwiGLU(eqx.Module):
 
     W: jax.Array
     V: jax.Array
+    b: jax.Array
+    c: jax.Array
 
     def __init__(self, dim_in, dim_out, key):
-        k1, k2 = jax.random.split(key, 2)
-
+        k1, k2, k3, k4 = jax.random.split(key, 4)
         self.W = jax.random.normal(k1, (dim_in, dim_out))
         self.V = jax.random.normal(k2, (dim_in, dim_out))
+        self.b = jax.random.normal(k3, (dim_out,))
+        self.c = jax.random.normal(k4, (dim_out,))
 
     def __call__(self, x):
-        return jax.nn.swish(jnp.dot(x, self.W)) * (jnp.dot(x, self.V))
+        return jax.nn.swish(jnp.dot(x, self.W) + self.b) * (jnp.dot(x, self.V) + self.c)
+
 
 @dataclass
 class GPTConfig:
@@ -53,6 +58,7 @@ class GPTConfig:
     n_embd: int = 768
     dropout: float = 0.0
     bias: bool = True  # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
+
 
 class CausalSelfAttention(eqx.Module):
     c_attn: eqx.nn.Linear
@@ -80,7 +86,8 @@ class CausalSelfAttention(eqx.Module):
         # causal mask to ensure that attention is only applied to the left in the input sequence
         # Has been made a buffer by using lax.stop_gradient whenever it is used.
         # Immutability calls for reshape, plus there is no view for jnp (or numpy) arrays.
-        self.bias = jnp.tril(jnp.ones((config.block_size, config.block_size))).reshape(1, 1, config.block_size, config.block_size)
+        self.bias = jnp.tril(jnp.ones((config.block_size, config.block_size))).reshape(1, 1, config.block_size,
+                                                                                       config.block_size)
 
     def __call__(self, x):
         T, C = jnp.shape(x)  # sequence length, embedding dimensionality (n_embd)
@@ -149,6 +156,7 @@ class Block(eqx.Module):
         x = x + self.mlp(jax.vmap(self.ln_2)(x))
         return x
 
+
 class TransformerLayer(eqx.Module):
     _config: GPTConfig = eqx.field(static=True)
 
@@ -185,13 +193,14 @@ class TransformerLayer(eqx.Module):
 
         return x
 
+
 class GPT(eqx.Module):
     _config: GPTConfig = eqx.field(static=True)
 
     transformer: TransformerLayer
     lm_head: eqx.nn.Linear
 
-    def __init__(self, config, key):        
+    def __init__(self, config, key):
         tkey, lmhkey = jax.random.split(key, 2)
 
         assert config.vocab_size is not None
@@ -199,12 +208,12 @@ class GPT(eqx.Module):
         self._config = config
 
         self.transformer = TransformerLayer(config, tkey)
-        
+
         self.lm_head = eqx.nn.Linear(config.n_embd, config.vocab_size, use_bias=False, key=lmhkey)
-    
+
         # report number of parameters
         print("number of parameters: %.2fM" % (self.get_num_params() / 1e6,))
-    
+
     def get_num_params(self, non_embedding=True):
         """
         Return the number of parameters in the model.
@@ -216,7 +225,7 @@ class GPT(eqx.Module):
         if non_embedding:
             n_params -= sum(self.transformer.wpe.weight.shape)
         return n_params
-    
+
     @staticmethod
     def create_instance(config, key):
         key1, key2 = jax.random.split(key, 2)
@@ -230,12 +239,12 @@ class GPT(eqx.Module):
     def _init_weights(model: eqx.Module, config: GPTConfig, key: jax.random.PRNGKey):
         def init_layer(model, is_layer: Callable, mean: float, std: float):
             get_weights = lambda m: [x.weight
-                                        for x in jax.tree_util.tree_leaves(m, is_leaf=is_layer)
-                                        if is_layer(x)]
+                                     for x in jax.tree_util.tree_leaves(m, is_leaf=is_layer)
+                                     if is_layer(x)]
             weights = get_weights(model)
 
             new_weights = [init.normal_(weight, mean=mean, std=std, key=subkey)
-                            for weight, subkey in zip(weights, jax.random.split(key, len(weights)))]
+                           for weight, subkey in zip(weights, jax.random.split(key, len(weights)))]
 
             return eqx.tree_at(get_weights, model, new_weights)
 
@@ -257,21 +266,21 @@ class GPT(eqx.Module):
             is_embedding = lambda x: isinstance(x, eqx.nn.Embedding)
 
             return init_layer(model, is_embedding, mean=0.0, std=0.2)
-        
+
         def init_transformer_wte_weights(model):
-            get_att_wte_weights = lambda m : GPT.find_sub_tree(m, "transformer.wte.weight")
-            get_lm_head_weights = lambda m : GPT.find_sub_tree(m, "lm_head.weight")
+            get_att_wte_weights = lambda m: GPT.find_sub_tree(m, "transformer.wte.weight")
+            get_lm_head_weights = lambda m: GPT.find_sub_tree(m, "lm_head.weight")
 
             lm_head_weights = get_lm_head_weights(model)
 
             return eqx.tree_at(get_att_wte_weights, model, lm_head_weights)
-        
+
         def init_c_proj_weights_with_normal(model):
-            get_c_proj_weights = lambda m : GPT.find_sub_tree(m, "c_proj.weight")
+            get_c_proj_weights = lambda m: GPT.find_sub_tree(m, "c_proj.weight")
 
             old_weights = get_c_proj_weights(model)
             new_weights = [init.normal_(weight, mean=0.0, std=0.02 / math.sqrt(2 * config.n_layer), key=subkey)
-                            for weight, subkey in zip(old_weights, jax.random.split(key, len(old_weights)))]
+                           for weight, subkey in zip(old_weights, jax.random.split(key, len(old_weights)))]
 
             return eqx.tree_at(get_c_proj_weights, model, new_weights)
 
@@ -301,9 +310,8 @@ class GPT(eqx.Module):
                     out.append(p)
             elif pn.endswith(sub_tree_name):
                 out.append(p)
-        
-        return out
 
+        return out
 
     def __call__(self, idx, train_mode=False):
         x = self.transformer(idx)
@@ -410,7 +418,8 @@ class GPT(eqx.Module):
         print(f"num non-decayed parameter tensors: {len(nodecay_params)}, with {num_nodecay_params:,} parameters")
         # Create AdamW optimizer and use the fused version if it is available
 
-        optimizer = optax.adamw(learning_rate=learning_rate, b1=b1, b2=b2, weight_decay=weight_decay, mask=decay_param_tree)
+        optimizer = optax.adamw(learning_rate=learning_rate, b1=b1, b2=b2, weight_decay=weight_decay,
+                                mask=decay_param_tree)
 
         return optimizer
 
@@ -449,7 +458,7 @@ class GPT(eqx.Module):
                 v, _ = lax.top_k(logits, min(top_k, logits.shape[-1]))
                 logits = logits.at[logits < v[:, [-1]]].set(-float('Inf'))
             # sample from the distribution
-            idx_next = jax.random.categorical(jax.random.PRNGKey(0), logits, shape=(1, ))
+            idx_next = jax.random.categorical(jax.random.PRNGKey(0), logits, shape=(1,))
             # append sampled index to the running sequence and continue
             idx = jnp.concatenate((idx, idx_next), axis=0)
 
