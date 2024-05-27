@@ -3,6 +3,7 @@ Sample from a trained model
 """
 import os
 import pickle
+import jax
 from contextlib import nullcontext
 import torch
 import tiktoken
@@ -23,13 +24,14 @@ compile = False # use PyTorch 2.0 to compile the model to be faster
 exec(open('executables/configurator.py').read()) # overrides from command line or config file
 # -----------------------------------------------------------------------------
 
-torch.manual_seed(seed)
-torch.cuda.manual_seed(seed)
-torch.backends.cuda.matmul.allow_tf32 = True # allow tf32 on matmul
-torch.backends.cudnn.allow_tf32 = True # allow tf32 on cudnn
-device_type = 'cuda' if 'cuda' in device else 'cpu' # for later use in torch.autocast
-ptdtype = {'float32': torch.float32, 'bfloat16': torch.bfloat16, 'float16': torch.float16}[dtype]
-ctx = nullcontext() if device_type == 'cpu' else torch.amp.autocast(device_type=device_type, dtype=ptdtype)
+key = jax.random.PRNGKey(seed)
+jax.default_matmul_precision = "tensorfloat32"
+# device_type = 'cuda' if 'cuda' in device else 'cpu' # for later use in torch.autocast
+# ptdtype = {'float32': torch.float32, 'bfloat16': torch.bfloat16, 'float16': torch.float16}[dtype]
+# ctx = nullcontext() if device_type == 'cpu' else torch.amp.autocast(device_type=device_type, dtype=ptdtype)
+
+def sample():
+    if init_from == 'resume':
 
 # model
 if init_from == 'resume':

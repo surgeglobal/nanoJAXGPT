@@ -19,9 +19,9 @@ $ torchrun --nproc_per_node=8 --nnodes=2 --node_rank=1 --master_addr=123.456.123
 import os
 import time
 import math
-import pickle
+import cloudpickle
 import random
-import modal
+from datetime import datetime
 
 import jax
 import jax.numpy as jnp
@@ -43,21 +43,27 @@ load_dotenv()
 # -----------------------------------------------------------------------------
 # default config values designed to train a gpt2 (124M) on OpenWebText
 # I/O
-timestamp = time.time()
-out_dir = f'/bucket/gpt2/{timestamp}'
-eval_interval = 100
+
+# Get the current date and time
+now = datetime.now()
+
+# Format it as a string
+timestamp = now.strftime("%Y%m%d_%H%M%S")
+
+out_dir = f'/vol/models/gpt2/{timestamp}'
+eval_interval = 10
 log_interval = 1
 eval_iters = 10
 eval_only = False  # if True, script exits right after the first eval
 always_save_checkpoint = False  # if True, always save a checkpoint after each eval
 init_from = 'scratch'  # 'scratch' or 'resume' or 'gpt2*'
 # wandb logging
-wandb_log = False  # disabled by default
+wandb_log = True  # disabled by default
 wandb_project = 'owt'
 wandb_run_name = 'gpt2'  # 'run' + str(time.time())
 # data
 dataset = 'shakespeare'
-batch_size = 8
+batch_size = 16
 block_size = 1024  ### If block size is different to 1024, changes need to be made in GPT.crop_block_size() method
 # model
 n_layer = 12
@@ -83,7 +89,7 @@ min_lr = 6e-5  # minimum learning rate, should be ~= learning_rate/10 per Chinch
 dtype = 'float32'
 # -----------------------------------------------------------------------------
 config_keys = [k for k, v in globals().items() if not k.startswith('_') and isinstance(v, (int, float, bool, str))]
-# exec(open('executables/configurator.py').read())  # overrides from command line or config file
+
 config = {k: globals()[k] for k in config_keys}  # will be useful for logging
 # -----------------------------------------------------------------------------
 
@@ -128,7 +134,7 @@ meta_path = os.path.join(data_dir, 'meta.pkl')
 meta_vocab_size = None
 if os.path.exists(meta_path):
     with open(meta_path, 'rb') as f:
-        meta = pickle.load(f)
+        meta = cloudpickle.load(f)
     meta_vocab_size = meta['vocab_size']
     print(f"found vocab_size = {meta_vocab_size} (inside {meta_path})")
 
@@ -217,12 +223,13 @@ lr_scheduler = optax.warmup_cosine_decay_schedule(
     decay_steps=lr_decay_iters,
     end_value=min_lr,
 )
-optimizer = optax.inject_hyperparams(optax.adamw)(learning_rate=lr_scheduler)
+optimizer = optax.inject_hyperparams(optax.adamw)(learning_rate=lr_scheduler, b1=beta1, b2=beta2)
 if init_from == 'resume':
     optimizer.load_state_dict(checkpoint['optimizer'])
 checkpoint = None  # free up memory
 
 
+@eqx.filter_jit
 def compute_loss(model, x, y):
     logits = jax.vmap(model, in_axes=(0, None))(x, True)
 
@@ -234,6 +241,7 @@ def compute_loss(model, x, y):
     return jnp.mean(loss)
 
 
+@eqx.filter_jit
 def make_step(
         model,
         optimizer_state,
@@ -257,7 +265,6 @@ def estimate_loss(model):
             loss = compute_loss(model, jax.lax.stop_gradient(x), y)
             losses = losses.at[k].set(loss.item())
         out[split] = jnp.mean(losses)
-    model = eqx.nn.inference_mode(model, value=False)
     return out
 
 
@@ -266,7 +273,7 @@ if wandb_log:
     import wandb
 
     wandb.login(key='d35eb3616c9549c90972c0d35b1efcc3b6af528f')
-    wandb.init(project=wandb_project, name=f"{wandb_run_name}-{timestamp}", config=config)
+    run = wandb.init(project=wandb_project, name=f"{wandb_run_name}-{timestamp}", config=config)
 
 
 def train():
@@ -294,13 +301,13 @@ def train():
                     "lr": lr,
                 })
             if losses['val'] < best_val_loss or always_save_checkpoint:
-                checkpoint_path = os.path.join(out_dir, f"checkpoint-{iter_num}")
-                os.makedirs(checkpoint_path, exist_ok=True)
-                checkpoint_file = os.path.join(checkpoint_path, 'model.eqx')
-                checkpoint_params_file = os.path.join(checkpoint_path, 'params.pkl')
-
                 best_val_loss = losses['val']
                 if iter_num > 0:
+                    os.makedirs(out_dir, exist_ok=True)
+                    checkpoint_file = os.path.join(out_dir, 'model.eqx')
+                    checkpoint_params_file = os.path.join(out_dir, 'params.pkl')
+
+                    eqx.tree_serialise_leaves(checkpoint_file, model)
                     checkpoint_params = {
                         "model_args": model_args,
                         "iter_num": iter_num,
@@ -309,8 +316,7 @@ def train():
                         "config": config,
                     }
                     with open(checkpoint_params_file, "wb") as f:
-                        pickle.dump(checkpoint_params, f)
-                    eqx.tree_serialise_leaves(checkpoint_file, model)
+                        cloudpickle.dump(checkpoint_params, f)
                     print(f"save checkpoint to {out_dir}")
 
         if iter_num == 0 and eval_only:
