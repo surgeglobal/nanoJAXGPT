@@ -10,6 +10,7 @@ https://github.com/huggingface/transformers/blob/main/src/transformers/models/gp
 import math
 import inspect
 from dataclasses import dataclass
+from tqdm import tqdm
 
 import jax
 from jax import lax
@@ -439,26 +440,27 @@ class GPT(eqx.Module):
         mfu = flops_achieved / flops_promised
         return mfu
 
-    def generate(self, idx, max_new_tokens, temperature=1.0, top_k=None):
+    def generate(self, idx, max_new_tokens, temperature=1.0, top_k=None, *, key):
         """
         Take a conditioning sequence of indices idx (LongTensor of shape (b,t)) and complete
         the sequence max_new_tokens times, feeding the predictions back into the model each time.
         """
         idx = jax.lax.stop_gradient(idx)
 
-        for _ in range(max_new_tokens):
+        for i in tqdm(range(max_new_tokens), desc="tokens"):
+            generate_key = jax.random.fold_in(key, i)
             # if the sequence context is growing too long we must crop it at block_size
             idx_cond = idx if idx.shape[0] <= self._config.block_size else idx[-self._config.block_size:]
             # forward the model to get the logits for the index in the sequence
-            logits, _ = self(idx_cond)
+            logits = self(idx_cond)
             # pluck the logits at the final step and scale by desired temperature
             logits = logits[-1, :] / temperature
             # optionally crop the logits to only the top k options
             if top_k is not None:
                 v, _ = lax.top_k(logits, min(top_k, logits.shape[-1]))
-                logits = logits.at[logits < v[:, [-1]]].set(-float('Inf'))
+                logits = logits.at[logits < v[-1]].set(-float('Inf'))
             # sample from the distribution
-            idx_next = jax.random.categorical(jax.random.PRNGKey(0), logits, shape=(1,))
+            idx_next = jax.random.categorical(generate_key, logits, shape=(1,))
             # append sampled index to the running sequence and continue
             idx = jnp.concatenate((idx, idx_next), axis=0)
 

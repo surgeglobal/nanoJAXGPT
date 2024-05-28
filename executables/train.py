@@ -34,6 +34,7 @@ from executables.model import GPTConfig, GPT
 from dotenv import load_dotenv
 
 jax.config.update("jax_enable_x64", True)
+jax.default_matmul_precision = "tensorfloat32"
 
 # -----------------------------------------------------------------------------
 # loading .env config
@@ -50,19 +51,19 @@ now = datetime.now()
 # Format it as a string
 timestamp = now.strftime("%Y%m%d_%H%M%S")
 
-out_dir = f'/vol/models/gpt2/{timestamp}'
-eval_interval = 10
+out_dir = f'/vol/{timestamp}'
+eval_interval = 2000
 log_interval = 1
-eval_iters = 10
+eval_iters = 200
 eval_only = False  # if True, script exits right after the first eval
 always_save_checkpoint = False  # if True, always save a checkpoint after each eval
 init_from = 'scratch'  # 'scratch' or 'resume' or 'gpt2*'
 # wandb logging
 wandb_log = True  # disabled by default
-wandb_project = 'owt'
+wandb_project = 'tinystories'
 wandb_run_name = 'gpt2'  # 'run' + str(time.time())
 # data
-dataset = 'shakespeare'
+dataset = 'tinystories'
 batch_size = 16
 block_size = 1024  ### If block size is different to 1024, changes need to be made in GPT.crop_block_size() method
 # model
@@ -89,7 +90,7 @@ min_lr = 6e-5  # minimum learning rate, should be ~= learning_rate/10 per Chinch
 dtype = 'float32'
 # -----------------------------------------------------------------------------
 config_keys = [k for k, v in globals().items() if not k.startswith('_') and isinstance(v, (int, float, bool, str))]
-
+# exec(open('config/train_shakespeare_char.py').read()) # overrides from command line or config file
 config = {k: globals()[k] for k in config_keys}  # will be useful for logging
 # -----------------------------------------------------------------------------
 
@@ -116,7 +117,7 @@ def get_batch(split: str):
     if split == 'train':
         data = np.memmap(os.path.join(data_dir, 'train.bin'), dtype=np.uint16, mode='r')
     else:
-        data = np.memmap(os.path.join(data_dir, 'val.bin'), dtype=np.uint16, mode='r')
+        data = np.memmap(os.path.join(data_dir, 'validation.bin'), dtype=np.uint16, mode='r')
 
     ix = np.random.randint(len(data) - block_size, size=(batch_size,))
     x = jnp.stack([jnp.array(data[i:i + block_size], dtype=jnp.int64) for i in ix])
@@ -302,17 +303,19 @@ def train():
                 })
             if losses['val'] < best_val_loss or always_save_checkpoint:
                 best_val_loss = losses['val']
-                if iter_num > 0:
+                if iter_num >= 0:
                     os.makedirs(out_dir, exist_ok=True)
                     checkpoint_file = os.path.join(out_dir, 'model.eqx')
                     checkpoint_params_file = os.path.join(out_dir, 'params.pkl')
+                    optimizer_state_file = os.path.join(out_dir, "optimizer_state.eqx")
 
                     eqx.tree_serialise_leaves(checkpoint_file, model)
+                    eqx.tree_serialise_leaves(optimizer_state_file, optimizer_state.inner_state)
                     checkpoint_params = {
                         "model_args": model_args,
                         "iter_num": iter_num,
                         "val_loss": losses["val"],
-                        "opt_state": optimizer_state,
+                        "opt_state": optimizer_state_file,
                         "config": config,
                     }
                     with open(checkpoint_params_file, "wb") as f:
