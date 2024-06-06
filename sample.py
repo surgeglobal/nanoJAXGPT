@@ -9,7 +9,7 @@ from modal import Image
 app = modal.App()
 
 # Setup volume for storing model weights
-volume = modal.Volume.from_name("pretraining-gpt2-matmul-prec")
+volume = modal.Volume.from_name("pretraining-gpt2-tinystories")
 MODEL_DIR = "/vol"
 
 image = (
@@ -19,14 +19,10 @@ image = (
 
 
 @app.function(
-    gpu="A100",
+    gpu="t4",
     timeout=86400, # Allow one day timout period
     image=image,
     mounts=[
-        modal.Mount.from_local_dir(
-            "./config",
-            remote_path="/root/config"
-        ),
         modal.Mount.from_local_dir(
             "./data",
             remote_path="/root/data"),
@@ -51,12 +47,12 @@ def sample():
 
     # -----------------------------------------------------------------------------
     init_from = 'resume' # either 'resume' (from an out_dir) or a gpt2 variant (e.g. 'gpt2-xl')
-    out_dir = '/vol/models/gpt2/shakespeare' # ignored if init_from is not 'resume'
+    out_dir = '/vol' # ignored if init_from is not 'resume'
 
-    start = """\n""" # or "<|endoftext|>" or etc. Can also specify a file, use as: "FILE:prompt.txt"
+    start = """Once upon a time, there were three researchers; Sachith, Chandeepa and Yasiru working for a company named Surge Global.""" # or "<|endoftext|>" or etc. Can also specify a file, use as: "FILE:prompt.txt"
 
     num_samples = 1 # number of samples to draw
-    max_new_tokens = 100 # number of tokens generated in each sample
+    max_new_tokens = 500 # number of tokens generated in each sample
     temperature = 0.8 # 1.0 = no change, < 1.0 = less random, > 1.0 = more random, in predictions
     top_k = 200 # retain only the top_k most likely tokens, clamp others to have 0 probability
     seed = 1337
@@ -65,15 +61,13 @@ def sample():
     key = jax.random.PRNGKey(seed)
     jax.default_matmul_precision = "tensorfloat32"
 
-    exec(open('config/train_shakespeare_char.py').read())
-
     checkpoint_params_file = os.path.join(out_dir, "params.pkl")
     checkpoint_file = os.path.join(out_dir, "model.eqx")
 
     with open(checkpoint_params_file, 'rb') as f:
         checkpoint_params = cloudpickle.load(f)
 
-    gptconf = GPTConfig(**checkpoint_params['model_args'])
+    gptconf = checkpoint_params['model_args']
     model = GPT(gptconf, key=key)
 
     model = eqx.tree_deserialise_leaves(checkpoint_file, model)

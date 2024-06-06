@@ -51,13 +51,20 @@ now = datetime.now()
 # Format it as a string
 timestamp = now.strftime("%Y%m%d_%H%M%S")
 
-out_dir = f'/vol/{timestamp}'
+out_dir = '/vol/'
+directories = [name for name in os.listdir(out_dir) if os.path.isdir(os.path.join(out_dir, name))]
+if len(directories) == 1:
+    resume_dir = os.path.join(out_dir, directories[0])
+else:
+    print("There is more than one directory or no directories in the specified directory.")
+    exit()
+
 eval_interval = 2000
 log_interval = 1
 eval_iters = 200
 eval_only = False  # if True, script exits right after the first eval
-always_save_checkpoint = False  # if True, always save a checkpoint after each eval
-init_from = 'scratch'  # 'scratch' or 'resume' or 'gpt2*'
+always_save_checkpoint = True  # if True, always save a checkpoint after each eval
+init_from = 'resume'  # 'scratch' or 'resume' or 'gpt2*'
 # wandb logging
 wandb_log = True  # disabled by default
 wandb_project = 'tinystories'
@@ -150,29 +157,44 @@ model_args = dict(
     dropout=dropout
 )  # start with model_args from command line
 
+
+def convert_model_to_dtype():
+    global model
+    def convert_pytree_to_dtype(pytree, dtype):
+        def _convert(leaf):
+            if eqx.is_array(leaf):
+                return leaf.astype(dtype)
+            else:
+                return leaf
+    
+        return jax.tree_util.tree_map(_convert, pytree)
+    
+    
+    if dtype == 'bfloat16':
+        model = convert_pytree_to_dtype(model, jnp.bfloat16)
+    elif dtype == 'float16':
+        model = convert_pytree_to_dtype(model, jnp.float16)
+    elif dtype == 'float32':
+        model = convert_pytree_to_dtype(model, jnp.float32)
+
+
 if init_from == 'resume':
-    print(f"Resuming training from {out_dir}")
+    print(f"Resuming training from {resume_dir}")
     # resume training from a checkpoint.
-    ckpt_path = os.path.join(out_dir, 'ckpt.pt')
-    checkpoint = torch.load(ckpt_path, map_location=device)
-    checkpoint_model_args = checkpoint['model_args']
-    # force these config attributes to be equal otherwise we can't even resume training
-    # the rest of the attributes (e.g. dropout) can stay as desired from command line
-    for k in ['n_layer', 'n_head', 'n_embd', 'block_size', 'bias', 'vocab_size']:
-        model_args[k] = checkpoint_model_args[k]
-    # create the model
-    gptconf = GPTConfig(**model_args)
-    model = GPT(gptconf)
-    state_dict = checkpoint['model']
-    # fix the keys of the state dictionary :(
-    # honestly no idea how checkpoints sometimes get this prefix, have to debug more
-    unwanted_prefix = '_orig_mod.'
-    for k, v in list(state_dict.items()):
-        if k.startswith(unwanted_prefix):
-            state_dict[k[len(unwanted_prefix):]] = state_dict.pop(k)
-    model.load_state_dict(state_dict)
-    iter_num = checkpoint['iter_num']
-    best_val_loss = checkpoint['best_val_loss']
+    checkpoint_params_file = os.path.join(resume_dir, "params.pkl")
+    checkpoint_file = os.path.join(resume_dir, "model.eqx")
+    with open(checkpoint_params_file, 'rb') as f:
+        checkpoint_params = cloudpickle.load(f)
+    gptconf = checkpoint_params['model_args']
+    if meta_vocab_size is None:
+        print("defaulting to vocab_size of GPT-2 to 50304 (50257 rounded up for efficiency)")
+    gptconf.vocab_size = meta_vocab_size if meta_vocab_size is not None else 50304
+    model = GPT(gptconf, key=gpt_key)
+    convert_model_to_dtype()
+    model = eqx.tree_deserialise_leaves(checkpoint_file, model)
+    iter_num = checkpoint_params['iter_num']
+    best_val_loss = checkpoint_params['val_loss']
+    learning_rate = checkpoint_params['learning_rate']
 elif init_from.startswith('gpt2'):
     print(f"Initializing from OpenAI GPT-2 weights: {init_from}")
     # initialize from OpenAI GPT-2 weights
@@ -190,24 +212,8 @@ else:
     model_args['vocab_size'] = meta_vocab_size if meta_vocab_size is not None else 50304
     gptconf = GPTConfig(**model_args)
     model = GPT(gptconf, gpt_key)
+    convert_model_to_dtype()
 
-
-def convert_pytree_to_dtype(pytree, dtype):
-    def _convert(leaf):
-        if eqx.is_array(leaf):
-            return leaf.astype(dtype)
-        else:
-            return leaf
-
-    return jax.tree_util.tree_map(_convert, pytree)
-
-
-if dtype == 'bfloat16':
-    model = convert_pytree_to_dtype(model, jnp.bfloat16)
-elif dtype == 'float16':
-    model = convert_pytree_to_dtype(model, jnp.float16)
-elif dtype == 'float32':
-    model = convert_pytree_to_dtype(model, jnp.float32)
 
 # # crop down the model block size if desired, using model surgery ## NOT IMPLEMENTED YET
 # if block_size < model.config.block_size:
@@ -220,14 +226,13 @@ elif dtype == 'float32':
 lr_scheduler = optax.warmup_cosine_decay_schedule(
     init_value=0.0,
     peak_value=learning_rate,
-    warmup_steps=warmup_iters,
-    decay_steps=lr_decay_iters,
+    warmup_steps=warmup_iters if init_from == 'scratch' else 0,
+    decay_steps=lr_decay_iters - iter_num,
     end_value=min_lr,
 )
 optimizer = optax.inject_hyperparams(optax.adamw)(learning_rate=lr_scheduler, b1=beta1, b2=beta2)
-if init_from == 'resume':
-    optimizer.load_state_dict(checkpoint['optimizer'])
-checkpoint = None  # free up memory
+
+checkpoint_params = None  # free up memory
 
 
 @eqx.filter_jit
@@ -250,7 +255,7 @@ def make_step(
         y
 ):
     loss, grads = eqx.filter_value_and_grad(compute_loss)(model, x, y)
-    updates, optimizer_state = optimizer.update(grads, optimizer_state, model) ## TODO: optimzer.update() issue needs to be resolved. updates initialize to NaN even from the step 0 and this effects the other values to become NaN
+    updates, optimizer_state = optimizer.update(grads, optimizer_state, model)
     model = eqx.apply_updates(model, updates)
     # print(model.transformer.h[0].mlp.c_fc.weight, model.transformer.h[0].mlp.c_fc.weight.mean())
     return model, optimizer_state, loss
@@ -280,49 +285,74 @@ if wandb_log:
 def train():
     global model
     global best_val_loss
+    global optimizer_state_file
+    global iter_num
+    
     # Initialize optimizer state with filtered model
     optimizer_state = optimizer.init(eqx.filter(model, eqx.is_array))
+    if init_from == 'resume':
+        optimizer_state.hyperparams['learning_rate'] = jnp.array(learning_rate, dtype=jnp.float32)    
 
     t0 = time.time()
-    for iter_num in range(max_iters):
+    for local_iter_num in range(iter_num, max_iters):
         x, y = get_batch("train")
 
         # evaluate the loss on train/val sets and write checkpoints
-        if (iter_num % eval_interval) == 0 or (iter_num == max_iters - 1):
+        if (local_iter_num % eval_interval) == 0 or (local_iter_num == max_iters - 1):
             losses = estimate_loss(model)
             lr = optimizer_state.hyperparams['learning_rate'].item()
 
-            print(f"step {iter_num}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}, lr {lr:.4e}")
+            print(f"step {local_iter_num}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}, lr {lr:.4e}")
+            print(f"best val loss {best_val_loss}")
 
             if wandb_log:
                 wandb.log({
-                    "iter": iter_num,
+                    "iter": local_iter_num,
                     "train/loss": losses['train'],
                     "val/loss": losses['val'],
                     "lr": lr,
                 })
-            if losses['val'] < best_val_loss or always_save_checkpoint:
+
+            # Checkpointing
+            checkpoint_params = {
+                "model_args": gptconf,
+                "iter_num": local_iter_num,
+                "val_loss": losses["val"],
+                "learning_rate": lr,
+                "config": config,
+            }
+            print(checkpoint_params)
+            
+            if losses['val'] < best_val_loss:
                 best_val_loss = losses['val']
-                if iter_num >= 0:
+                if local_iter_num > 0:
                     os.makedirs(out_dir, exist_ok=True)
                     checkpoint_file = os.path.join(out_dir, 'model.eqx')
                     checkpoint_params_file = os.path.join(out_dir, 'params.pkl')
-                    optimizer_state_file = os.path.join(out_dir, "optimizer_state.eqx")
+                    # optimizer_state_file = os.path.join(out_dir, "optimizer_state.eqx")
 
                     eqx.tree_serialise_leaves(checkpoint_file, model)
-                    eqx.tree_serialise_leaves(optimizer_state_file, optimizer_state.inner_state)
-                    checkpoint_params = {
-                        "model_args": model_args,
-                        "iter_num": iter_num,
-                        "val_loss": losses["val"],
-                        "opt_state": optimizer_state_file,
-                        "config": config,
-                    }
+                    # eqx.tree_serialise_leaves(optimizer_state_file, optimizer_state.inner_state)
+                    
                     with open(checkpoint_params_file, "wb") as f:
                         cloudpickle.dump(checkpoint_params, f)
-                    print(f"save checkpoint to {out_dir}")
+                    print(f"save best checkpoint to {out_dir}")
 
-        if iter_num == 0 and eval_only:
+            if always_save_checkpoint:
+                # Save checkpoint to resume training
+                latest_checkpoint_dir = os.path.join(out_dir, f"checkpoint-{local_iter_num}")
+                os.makedirs(latest_checkpoint_dir, exist_ok=True)
+                latest_checkpoint_file = os.path.join(latest_checkpoint_dir, 'model.eqx')
+                latest_checkpoint_params_file = os.path.join(latest_checkpoint_dir, 'params.pkl')
+    
+                eqx.tree_serialise_leaves(latest_checkpoint_file, model)
+                
+                with open(latest_checkpoint_params_file, "wb") as f:
+                    cloudpickle.dump(checkpoint_params, f)
+                print(f"save checkpoint to {latest_checkpoint_dir}")
+            
+
+        if local_iter_num == 0 and eval_only:
             break
 
         # do a training step
@@ -331,7 +361,7 @@ def train():
         t1 = time.time()
         dt = t1 - t0
         t0 = t1
-        if iter_num % log_interval == 0:
-            print(f"iter {iter_num} \t loss: {loss.item():.4f} \t time {dt*1000:.2f}ms")
+        if local_iter_num % log_interval == 0:
+            print(f"iter {local_iter_num} \t loss: {loss.item():.4f} \t time {dt*1000:.2f}ms")
             if wandb_log:
-                wandb.log({"train_iter": iter_num, "train_loss": loss.item()})
+                wandb.log({"train_iter": local_iter_num, "train_loss": loss.item()})

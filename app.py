@@ -5,17 +5,19 @@ from modal import Image
 app = modal.App()
 
 # Setup volume for storing model weights
-volume = modal.Volume.from_name("pretraining-gpt2-tinystories", create_if_missing=True)
+volume = modal.Volume.from_name("pretraining-gpt2-tinystories")
 MODEL_DIR = "/vol"
+
+GPU = 'A100'
 
 image = (
     Image.from_registry("thr3a/cuda12.1-torch")
-    .pip_install("jax[cuda12]", "jaxlib", "equinox", "datasets", "optax", "tqdm", "python-dotenv", "numpy", "tiktoken", "wandb", gpu="A100")
+    .pip_install("jax[cuda12]", "jaxlib", "equinox", "datasets", "optax", "tqdm", "python-dotenv", "numpy", "tiktoken", "wandb", gpu=GPU)
 )
 
 
 @app.function(
-    gpu="A100",
+    gpu=GPU,
     timeout=86400, # Allow one day timout period
     image=image,
     mounts=[

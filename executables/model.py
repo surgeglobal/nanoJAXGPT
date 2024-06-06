@@ -268,16 +268,8 @@ class GPT(eqx.Module):
 
             return init_layer(model, is_embedding, mean=0.0, std=0.2)
 
-        def init_transformer_wte_weights(model):
-            get_att_wte_weights = lambda m: GPT.find_sub_tree(m, "transformer.wte.weight")
-            get_lm_head_weights = lambda m: GPT.find_sub_tree(m, "lm_head.weight")
-
-            lm_head_weights = get_lm_head_weights(model)
-
-            return eqx.tree_at(get_att_wte_weights, model, lm_head_weights)
-
         def init_c_proj_weights_with_normal(model):
-            get_c_proj_weights = lambda m: GPT.find_sub_tree(m, "c_proj.weight")
+            get_c_proj_weights = lambda m: eqx_helper.find_sub_tree(m, "c_proj.weight")
 
             old_weights = get_c_proj_weights(model)
             new_weights = [init.normal_(weight, mean=0.0, std=0.02 / math.sqrt(2 * config.n_layer), key=subkey)
@@ -287,32 +279,10 @@ class GPT(eqx.Module):
 
         initialized_model = init_linear(model)
         initialized_model = init_embedding(initialized_model)
-        # Update the att_wte weights
-        initialized_model = init_transformer_wte_weights(initialized_model)
         # apply special scaled init to the residual projections, per GPT-2 paper
         initialized_model = init_c_proj_weights_with_normal(initialized_model)
 
         return initialized_model
-
-    @staticmethod
-    def find_sub_tree(model: eqx.Module, sub_tree_name: str, filter_fn: Callable = None):
-        out = []
-        for path, p in jax.tree_util.tree_flatten_with_path(model, is_leaf=filter_fn)[0]:
-            pn = ''
-
-            for index in range(len(path)):
-                if isinstance(path[index], jax._src.tree_util.DictKey):
-                    pn += '.' + path[index].key
-                else:
-                    pn += str(path[index])
-
-            if filter_fn:
-                if filter_fn(p) and pn.endswith(sub_tree_name):
-                    out.append(p)
-            elif pn.endswith(sub_tree_name):
-                out.append(p)
-
-        return out
 
     def __call__(self, idx, train_mode=False):
         x = self.transformer(idx)

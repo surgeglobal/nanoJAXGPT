@@ -21,20 +21,20 @@ def named_parameters(model: eqx.Module):
 
 
 def find_sub_tree(model: eqx.Module, sub_tree_name: str, filter_fn: Callable = None):
-        out = []
-        for path, p in jax.tree_util.tree_flatten_with_path(model, is_leaf=filter_fn)[0]:
-            pn = ''
-
-            for index in range(len(path)):
-                if isinstance(path[index], jax._src.tree_util.DictKey):
-                    pn += '.' + path[index].key
-                else:
-                    pn += str(path[index])
-
-            if filter_fn:
-                if filter_fn(p) and pn.endswith(sub_tree_name):
-                    out.append(p)
-            elif pn.endswith(sub_tree_name):
+    out = []
+    for path, p in jax.tree_util.tree_flatten_with_path(model, is_leaf=filter_fn)[0]:
+        pn = ''
+    
+        for index in range(len(path)):
+            if isinstance(path[index], jax._src.tree_util.DictKey):
+                pn += '.' + path[index].key
+            else:
+                pn += str(path[index])
+    
+        if filter_fn:
+            if filter_fn(p) and pn.endswith(sub_tree_name):
                 out.append(p)
-        
-        return out
+        elif pn.endswith(sub_tree_name):
+            out.append(p)
+    
+    return out
