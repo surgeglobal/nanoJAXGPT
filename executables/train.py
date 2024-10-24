@@ -51,7 +51,13 @@ now = datetime.now()
 # Format it as a string
 timestamp = now.strftime("%Y%m%d_%H%M%S")
 
-out_dir = '/vol/'
+# Setup volume for storing model weights
+if os.getenv("MODAL_ENVIRONMENT") == "remote":
+    out_dir = "/vol"
+else:
+    out_dir = "./vol"
+
+
 directories = [name for name in os.listdir(out_dir) if os.path.isdir(os.path.join(out_dir, name))]
 if len(directories) == 1:
     resume_dir = os.path.join(out_dir, directories[0])

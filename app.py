@@ -5,7 +5,7 @@ from modal import Image
 app = modal.App()
 
 # Setup volume for storing model weights
-volume = modal.Volume.from_name("pretraining-gpt2-tinystories")
+volume = modal.Volume.from_name("pretraining-gpt2-tinystories", create_if_missing=True)
 MODEL_DIR = "/vol"
 
 GPU = 'A100'
@@ -38,7 +38,7 @@ image = (
 def run_train_on_modal():
     import subprocess
     import os
-    subprocess.run(["python", "prepare.py"], cwd="data/tinystories/")
+    subprocess.run(["python3", "prepare.py"], cwd="data/tinystories/")
 
     os.environ['XLA_PYTHON_CLIENT_PREALLOCATE'] = 'false'
     os.environ['XLA_PYTHON_CLIENT_ALLOCATOR'] = 'platform'
@@ -48,5 +48,10 @@ def run_train_on_modal():
 
 
 @app.local_entrypoint()
-def main():
-    run_train_on_modal.remote()
+def main(
+    run_on_remote: bool = False
+):
+    if run_on_remote:
+        run_train_on_modal.remote()
+    else:
+        run_train_on_modal.local()
