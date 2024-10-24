@@ -60,7 +60,7 @@ If you're new to JAX or just want to get your feet wet, let's start a simple tra
 
 > 📖 **Want to train on your custom datasets?** You can create custom scripts for your preferred datasets as we have done for the tinystories dataset.
 
-**I have a GPU/TPU**. Excellent! JAX shines on accelerators. Let's train using the config in [config/train_shakespeare_char.py](config/train_shakespeare_char.py):
+**I have a GPU/TPU**. Excellent! JAX shines on accelerators. Let's train an example story telling model.
 
 This project is set up to run locally by default, but you can easily switch to running on a remote GPU provided by [modal.com](https://modal.com).
 

@@ -11,3 +11,4 @@ modal~=0.62.173
 wandb~=0.17.0
 modal
 datasets
+cloudpickle
